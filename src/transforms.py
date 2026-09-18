@@ -28,11 +28,16 @@ from numpy.typing import NDArray
 # ---------------------------------------------------------------------------
 _EPS = 1e-10
 _SMALL_ANGLE = 1e-7
+# Threshold (on pi - theta) below which the symmetric eigenvector form is used
+# to recover the rotation axis, because the antisymmetric part has lost
+# precision.  See so3_log.
+_PI_TOL = 1e-2
 
 
 # ===================================================================
 #  1. Rotation matrix from Euler angles (ZYX intrinsic convention)
 # ===================================================================
+
 
 def rotation_matrix_from_euler(
     roll: float, pitch: float, yaw: float
@@ -80,21 +85,27 @@ def rotation_matrix_from_euler(
     cp, sp = np.cos(pitch), np.sin(pitch)
     cy, sy = np.cos(yaw), np.sin(yaw)
 
-    Rx = np.array([
-        [1.0,  0.0, 0.0],
-        [0.0,  cr, -sr],
-        [0.0,  sr,  cr],
-    ])
-    Ry = np.array([
-        [ cp, 0.0, sp],
-        [0.0, 1.0, 0.0],
-        [-sp, 0.0, cp],
-    ])
-    Rz = np.array([
-        [cy, -sy, 0.0],
-        [sy,  cy, 0.0],
-        [0.0, 0.0, 1.0],
-    ])
+    Rx = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, cr, -sr],
+            [0.0, sr, cr],
+        ]
+    )
+    Ry = np.array(
+        [
+            [cp, 0.0, sp],
+            [0.0, 1.0, 0.0],
+            [-sp, 0.0, cp],
+        ]
+    )
+    Rz = np.array(
+        [
+            [cy, -sy, 0.0],
+            [sy, cy, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
 
     return Rz @ Ry @ Rx
 
@@ -102,6 +113,7 @@ def rotation_matrix_from_euler(
 # ===================================================================
 #  2. Skew-symmetric matrix  /  unskew
 # ===================================================================
+
 
 def skew(v: NDArray[np.float64]) -> NDArray[np.float64]:
     r"""Return the 3×3 skew-symmetric (hat) matrix of a 3-vector.
@@ -125,11 +137,13 @@ def skew(v: NDArray[np.float64]) -> NDArray[np.float64]:
     S : ndarray, shape (3, 3)
     """
     v = np.asarray(v, dtype=np.float64).ravel()
-    return np.array([
-        [ 0.0,  -v[2],  v[1]],
-        [ v[2],  0.0,  -v[0]],
-        [-v[1],  v[0],  0.0],
-    ])
+    return np.array(
+        [
+            [0.0, -v[2], v[1]],
+            [v[2], 0.0, -v[0]],
+            [-v[1], v[0], 0.0],
+        ]
+    )
 
 
 def unskew(S: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -158,6 +172,7 @@ def unskew(S: NDArray[np.float64]) -> NDArray[np.float64]:
 # ===================================================================
 #  3. Rodrigues' rotation formula  (axis-angle ↔ matrix)
 # ===================================================================
+
 
 def rodrigues(axis: NDArray[np.float64], angle: float) -> NDArray[np.float64]:
     r"""Compute a rotation matrix via Rodrigues' rotation formula.
@@ -210,8 +225,9 @@ def rodrigues_inv(R: NDArray[np.float64]) -> tuple[NDArray[np.float64], float]:
 
     Edge cases:
       * **θ ≈ 0** : axis is undefined; we return  [0, 0, 1]  by convention.
-      * **θ ≈ π** : the antisymmetric part vanishes.  We recover the axis from
-        the column of  R + I  with the largest norm.
+      * **θ ≈ π** : the antisymmetric part vanishes.  We read the axis from the
+        dominant diagonal entry of  R + I = 2 ω̂ω̂ᵀ,  which is numerically
+        robust where the column heuristic is not.
 
     Parameters
     ----------
@@ -231,19 +247,30 @@ def rodrigues_inv(R: NDArray[np.float64]) -> tuple[NDArray[np.float64], float]:
     if angle < _SMALL_ANGLE:
         return np.array([0.0, 0.0, 1.0]), 0.0
 
-    if np.pi - angle < _SMALL_ANGLE:
-        # θ ≈ π  →  R + I = 2 ω̂ ω̂ᵀ.  Pick the column with largest norm.
-        M = R + np.eye(3)
-        col = np.argmax(np.sum(M ** 2, axis=0))
-        axis = M[:, col]
-        axis = axis / np.linalg.norm(axis)
+    if np.pi - angle < _PI_TOL:
+        # θ ≈ π  →  the axis is the eigenvalue-1 eigenvector of the symmetric
+        # matrix (R + Rᵀ)/2, with the sign fixed by the antisymmetric part.
+        S = 0.5 * (R + R.T)
+        _, evecs = np.linalg.eigh(S)
+        axis = evecs[:, 2]
+        A = 0.5 * (R - R.T)
+        k = int(np.argmin(np.abs(axis)))
+        q = np.cross(axis, np.eye(3)[k])
+        nq = np.linalg.norm(q)
+        if nq < _EPS:
+            return axis, float(angle)
+        q = q / nq
+        if np.dot(A @ q, np.cross(axis, q)) < 0.0:
+            axis = -axis
         return axis, float(angle)
 
-    axis = np.array([
-        R[2, 1] - R[1, 2],
-        R[0, 2] - R[2, 0],
-        R[1, 0] - R[0, 1],
-    ])
+    axis = np.array(
+        [
+            R[2, 1] - R[1, 2],
+            R[0, 2] - R[2, 0],
+            R[1, 0] - R[0, 1],
+        ]
+    )
     axis = axis / (2.0 * np.sin(angle))
     return axis, float(angle)
 
@@ -251,6 +278,7 @@ def rodrigues_inv(R: NDArray[np.float64]) -> tuple[NDArray[np.float64], float]:
 # ===================================================================
 #  4. Quaternion operations  (scalar-first  [w, x, y, z])
 # ===================================================================
+
 
 def normalize_quaternion(q: NDArray[np.float64]) -> NDArray[np.float64]:
     """Return the unit quaternion  q / ‖q‖.
@@ -317,12 +345,14 @@ def quaternion_multiply(
     q2 = np.asarray(q2, dtype=np.float64).ravel()
     w1, x1, y1, z1 = q1
     w2, x2, y2, z2 = q2
-    return np.array([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2,
-    ])
+    return np.array(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ]
+    )
 
 
 def quaternion_to_matrix(q: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -350,11 +380,13 @@ def quaternion_to_matrix(q: NDArray[np.float64]) -> NDArray[np.float64]:
     """
     q = normalize_quaternion(q)
     w, x, y, z = q
-    return np.array([
-        [1 - 2*(y*y + z*z),  2*(x*y - w*z),      2*(x*z + w*y)],
-        [2*(x*y + w*z),      1 - 2*(x*x + z*z),  2*(y*z - w*x)],
-        [2*(x*z - w*y),      2*(y*z + w*x),      1 - 2*(x*x + y*y)],
-    ])
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ]
+    )
 
 
 def matrix_to_quaternion(R: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -390,12 +422,14 @@ def matrix_to_quaternion(R: NDArray[np.float64]) -> NDArray[np.float64]:
     R = np.asarray(R, dtype=np.float64)
 
     trace = R[0, 0] + R[1, 1] + R[2, 2]
-    candidates = np.array([
-        trace,            # proportional to 4w²-1
-        R[0, 0] - R[1, 1] - R[2, 2],  # 4x²-1
-        -R[0, 0] + R[1, 1] - R[2, 2], # 4y²-1
-        -R[0, 0] - R[1, 1] + R[2, 2], # 4z²-1
-    ])
+    candidates = np.array(
+        [
+            trace,  # proportional to 4w²-1
+            R[0, 0] - R[1, 1] - R[2, 2],  # 4x²-1
+            -R[0, 0] + R[1, 1] - R[2, 2],  # 4y²-1
+            -R[0, 0] - R[1, 1] + R[2, 2],  # 4z²-1
+        ]
+    )
     idx = int(np.argmax(candidates))
 
     if idx == 0:
@@ -490,9 +524,8 @@ def slerp(
 #  5. SE(3) pose operations (4×4 homogeneous matrices)
 # ===================================================================
 
-def se3_from_Rt(
-    R: NDArray[np.float64], t: NDArray[np.float64]
-) -> NDArray[np.float64]:
+
+def se3_from_Rt(R: NDArray[np.float64], t: NDArray[np.float64]) -> NDArray[np.float64]:
     r"""Construct a 4×4 homogeneous transformation from *R* and *t*.
 
     .. math::
@@ -595,6 +628,7 @@ def se3_inverse(T: NDArray[np.float64]) -> NDArray[np.float64]:
 #  6. SO(3) Lie-group exponential / logarithm / Jacobians
 # ===================================================================
 
+
 def so3_exp(omega: NDArray[np.float64]) -> NDArray[np.float64]:
     r"""SO(3) exponential map: axis-angle 3-vector → rotation matrix.
 
@@ -658,8 +692,15 @@ def so3_log(R: NDArray[np.float64]) -> NDArray[np.float64]:
     ----------
     * **θ ≈ 0** :  Use the first-order approximation
       ω ≈ ½ [R₃₂−R₂₃, R₁₃−R₃₁, R₂₁−R₁₂]ᵀ.
-    * **θ ≈ π** :  The antisymmetric part vanishes.  We recover the axis from
-      the column of  R + I  with the largest norm and scale by θ.
+    * **θ ≈ π** :  The antisymmetric part vanishes.  We use the identity
+      R + I = 2 ω̂ω̂ᵀ and read the axis off the **largest diagonal entry** of
+      R + I, which avoids the loss of sign precision that occurs when the
+      axis is taken from a merely near-dominant column.
+
+    Notes
+    -----
+    The returned vector always satisfies ‖ω‖ = θ ∈ [0, π], i.e. it is the
+    principal branch of the logarithm.
 
     Parameters
     ----------
@@ -675,25 +716,43 @@ def so3_log(R: NDArray[np.float64]) -> NDArray[np.float64]:
     theta = float(np.arccos(cos_angle))
 
     if theta < _SMALL_ANGLE:
-        return 0.5 * np.array([
-            R[2, 1] - R[1, 2],
-            R[0, 2] - R[2, 0],
-            R[1, 0] - R[0, 1],
-        ])
+        return 0.5 * np.array(
+            [
+                R[2, 1] - R[1, 2],
+                R[0, 2] - R[2, 0],
+                R[1, 0] - R[0, 1],
+            ]
+        )
 
-    if np.pi - theta < _SMALL_ANGLE:
-        M = R + np.eye(3)
-        col = int(np.argmax(np.sum(M ** 2, axis=0)))
-        axis = M[:, col]
-        axis = axis / np.linalg.norm(axis)
+    # Generic branch.  The antisymmetric part  (R - Rᵀ)/2 = sin θ · [ω̂]×
+    # is exact but degrades as 1/sin θ near θ = π.  For θ > π/2 we instead
+    # take the axis from the dominant eigenvector of the symmetric matrix
+    #   (R + Rᵀ)/2 = I + (1 − cos θ)[ω̂]²_× ,
+    # whose eigenvalue 1 eigenvector is exactly ω̂, and fix the sign with the
+    # antisymmetric part.  This is uniformly accurate over θ ∈ (0, π).
+    if theta < 0.5 * np.pi:
+        a = np.array(
+            [
+                R[2, 1] - R[1, 2],
+                R[0, 2] - R[2, 0],
+                R[1, 0] - R[0, 1],
+            ]
+        )
+        return (theta / (2.0 * np.sin(theta))) * a
+
+    S = 0.5 * (R + R.T)
+    _, evecs = np.linalg.eigh(S)
+    axis = evecs[:, 2]  # eigenvector for the largest λ
+    A = 0.5 * (R - R.T)
+    k = int(np.argmin(np.abs(axis)))
+    q = np.cross(axis, np.eye(3)[k])
+    nq = np.linalg.norm(q)
+    if nq < _EPS:
         return axis * theta
-
-    factor = theta / (2.0 * np.sin(theta))
-    return factor * np.array([
-        R[2, 1] - R[1, 2],
-        R[0, 2] - R[2, 0],
-        R[1, 0] - R[0, 1],
-    ])
+    q = q / nq
+    if np.dot(A @ q, np.cross(axis, q)) < 0.0:
+        axis = -axis
+    return axis * theta
 
 
 def _so3_left_jacobian_coeffs(
@@ -774,6 +833,7 @@ def so3_right_jacobian(omega: NDArray[np.float64]) -> NDArray[np.float64]:
 #  7. SE(3) Lie-group exponential / logarithm / adjoint
 # ===================================================================
 
+
 def _V_matrix(omega: NDArray[np.float64]) -> NDArray[np.float64]:
     r"""Compute the *V* matrix used in the SE(3) exponential map.
 
@@ -800,20 +860,23 @@ def _V_matrix_inv(omega: NDArray[np.float64]) -> NDArray[np.float64]:
               - \frac{\theta\sin\theta}{2(1-\cos\theta)}\right)
               [\omega]_\times^2
 
-    For small θ the scalar coefficient of [ω]²_× is expanded as
+    The reflection formula is used for large θ; for small θ the series
 
     .. math::
 
-        c \approx \tfrac{1}{12} + \tfrac{\theta^2}{720}
+        c = \frac{1}{12} + \frac{\theta^2}{720} + \frac{\theta^4}{30240}
+
+    is used instead, because the direct quotient suffers catastrophic
+    cancellation as θ → 0.
     """
     omega = np.asarray(omega, dtype=np.float64).ravel()
     theta = float(np.linalg.norm(omega))
     K = skew(omega)
 
-    if theta < _SMALL_ANGLE:
-        c = 1.0 / 12.0 + theta**2 / 720.0
+    if theta < 1e-2:
+        t2 = theta * theta
+        c = 1.0 / 12.0 + t2 / 720.0 + t2 * t2 / 30240.0
     else:
-        half_theta = theta / 2.0
         c = (1.0 / (theta**2)) * (
             1.0 - (theta * np.sin(theta)) / (2.0 * (1.0 - np.cos(theta)))
         )
@@ -918,9 +981,8 @@ def se3_adjoint(T: NDArray[np.float64]) -> NDArray[np.float64]:
 #  8. Utility helpers
 # ===================================================================
 
-def is_rotation_matrix(
-    R: NDArray[np.float64], tol: float = 1e-6
-) -> bool:
+
+def is_rotation_matrix(R: NDArray[np.float64], tol: float = 1e-6) -> bool:
     r"""Check whether *R* is a proper rotation matrix.
 
     A proper rotation satisfies:
@@ -946,9 +1008,7 @@ def is_rotation_matrix(
     return bool(err_orth < tol and err_det < tol)
 
 
-def angle_between_rotations(
-    R1: NDArray[np.float64], R2: NDArray[np.float64]
-) -> float:
+def angle_between_rotations(R1: NDArray[np.float64], R2: NDArray[np.float64]) -> float:
     r"""Geodesic angle between two rotation matrices.
 
     .. math::

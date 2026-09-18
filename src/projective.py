@@ -25,10 +25,10 @@ from numpy.typing import NDArray
 # ---------------------------------------------------------------------------
 # Type aliases
 # ---------------------------------------------------------------------------
-Points2D = NDArray[np.floating]   # (N, 2)
-Points3D = NDArray[np.floating]   # (N, 3)
-PointsH = NDArray[np.floating]    # homogeneous: (N, 3) or (N, 4)
-Mat3 = NDArray[np.floating]       # (3, 3)
+Points2D = NDArray[np.floating]  # (N, 2)
+Points3D = NDArray[np.floating]  # (N, 3)
+PointsH = NDArray[np.floating]  # homogeneous: (N, 3) or (N, 4)
+Mat3 = NDArray[np.floating]  # (3, 3)
 
 # ====================================================================== #
 #  1.  Homogeneous coordinate utilities                                  #
@@ -141,7 +141,7 @@ def hartley_normalize(
     points = np.asarray(points, dtype=np.float64)
     centroid = points.mean(axis=0)
     shifted = points - centroid
-    mean_dist = np.sqrt((shifted ** 2).sum(axis=1)).mean()
+    mean_dist = np.sqrt((shifted**2).sum(axis=1)).mean()
 
     if mean_dist < 1e-12:
         raise ValueError("All points are coincident; normalization is undefined.")
@@ -242,15 +242,27 @@ def compute_homography_dlt(
         xp, yp = dst_norm[i]
         # Row 2i:   [0, 0, 0, -x, -y, -1, y'x, y'y, y']
         A[2 * i] = [
-            0.0, 0.0, 0.0,
-            -x, -y, -1.0,
-            yp * x, yp * y, yp,
+            0.0,
+            0.0,
+            0.0,
+            -x,
+            -y,
+            -1.0,
+            yp * x,
+            yp * y,
+            yp,
         ]
         # Row 2i+1: [x, y, 1, 0, 0, 0, -x'x, -x'y, -x']
         A[2 * i + 1] = [
-            x, y, 1.0,
-            0.0, 0.0, 0.0,
-            -xp * x, -xp * y, -xp,
+            x,
+            y,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            -xp * x,
+            -xp * y,
+            -xp,
         ]
 
     # Step 3 – solve via SVD
@@ -420,40 +432,42 @@ def warp_image(
     h_in, w_in = image.shape[:2]
     is_colour = image.ndim == 3
 
-    # Floor coordinates for bilinear neighbours
-    u0 = np.floor(u).astype(np.int64)
-    v0 = np.floor(v).astype(np.int64)
-    u1 = u0 + 1
-    v1 = v0 + 1
+    # Validity on continuous coordinates: a sample is inside the source
+    # image when it lies in the closed pixel-centre domain
+    # [0, w-1] x [0, h-1].  (Testing the integer neighbours instead would
+    # wrongly discard the last row/column, e.g. for an identity warp.)
+    tol = 1e-9
+    valid = (u >= -tol) & (u <= w_in - 1 + tol) & (v >= -tol) & (v <= h_in - 1 + tol)
 
-    # Fractional parts
+    # Floor coordinates for bilinear neighbours, clamped so indexing is
+    # always safe; the fractional weights use the *unclamped* values.
+    u0 = np.clip(np.floor(u).astype(np.int64), 0, w_in - 1)
+    v0 = np.clip(np.floor(v).astype(np.int64), 0, h_in - 1)
+    u1 = np.minimum(u0 + 1, w_in - 1)
+    v1 = np.minimum(v0 + 1, h_in - 1)
+
+    # Fractional parts (outside the valid domain these may leave [0, 1),
+    # but those samples are zeroed by the validity mask anyway).
     a = (u - u0).astype(np.float64)
     b = (v - v0).astype(np.float64)
 
-    # Validity mask
-    valid = (u0 >= 0) & (v0 >= 0) & (u1 < w_in) & (v1 < h_in)
-
-    # Clamp to image bounds for safe indexing
-    u0c = np.clip(u0, 0, w_in - 1)
-    v0c = np.clip(v0, 0, h_in - 1)
-    u1c = np.clip(u1, 0, w_in - 1)
-    v1c = np.clip(v1, 0, h_in - 1)
-
     if is_colour:
-        I00 = image[v0c, u0c].astype(np.float64)  # (N, C)
-        I10 = image[v0c, u1c].astype(np.float64)
-        I01 = image[v1c, u0c].astype(np.float64)
-        I11 = image[v1c, u1c].astype(np.float64)
+        I00 = image[v0, u0].astype(np.float64)  # (N, C)
+        I10 = image[v0, u1].astype(np.float64)
+        I01 = image[v1, u0].astype(np.float64)
+        I11 = image[v1, u1].astype(np.float64)
         a = a[:, None]
         b = b[:, None]
         valid = valid[:, None]
     else:
-        I00 = image[v0c, u0c].astype(np.float64)
-        I10 = image[v0c, u1c].astype(np.float64)
-        I01 = image[v1c, u0c].astype(np.float64)
-        I11 = image[v1c, u1c].astype(np.float64)
+        I00 = image[v0, u0].astype(np.float64)
+        I10 = image[v0, u1].astype(np.float64)
+        I01 = image[v1, u0].astype(np.float64)
+        I11 = image[v1, u1].astype(np.float64)
 
-    interp = (1 - a) * (1 - b) * I00 + a * (1 - b) * I10 + (1 - a) * b * I01 + a * b * I11
+    interp = (
+        (1 - a) * (1 - b) * I00 + a * (1 - b) * I10 + (1 - a) * b * I01 + a * b * I11
+    )
     result = np.where(valid, interp, 0.0)
 
     if is_colour:
@@ -518,7 +532,7 @@ def cross_ratio(
     if norm2 < 1e-30:
         raise ValueError("p1 and p2 are coincident; cross-ratio undefined.")
 
-    def _signed(a: NDArray, b: NDArray) -> float:
+    def _signed(a: NDArray[np.floating], b: NDArray[np.floating]) -> float:
         """Signed distance from *a* to *b* projected onto the line direction."""
         return float(np.dot(b - a, d) / np.sqrt(norm2))
 
@@ -695,15 +709,40 @@ def _cross_ratio_height(
     vh_ref_e: NDArray[np.float64],
     vh_q_e: NDArray[np.float64],
 ) -> float:
-    """Compute object height from cross-ratio distance invariants."""
+    r"""Compute object height from cross-ratio distance invariants.
+
+    Implements the Criminisi single-view metrology formula
+    (Hartley & Zisserman §3.3 / §8.7).  With :math:`B, T` the foot/top
+    of the query, :math:`B_r, T_r` those of the reference of known
+    height :math:`H_r`, :math:`V` the vertical vanishing point and
+    :math:`V_h, V_{h,r}` the horizon intercepts of the two vertical
+    lines:
+
+    .. math::
+        H = H_r\; \frac{\lVert T - B\rVert}{\lVert T_r - B_r\rVert}
+          \cdot \frac{\lVert V_{h,q} - V\rVert}{\lVert V_{h,r} - V\rVert}
+          \cdot \frac{\lVert V_{h,r} - B_r\rVert}{\lVert V_{h,q} - B\rVert}
+          \cdot \frac{\lVert V - T_r\rVert}{\lVert V - T\rVert}
+
+    The last factor (top-to-VP distances) is required for correctness
+    when the two objects are at different depths; omitting it only
+    works when the vertical lines coincide (equal depth).
+    """
     dist_tb = np.linalg.norm(t_e - b_e)
     dist_tr_br = np.linalg.norm(tr_e - br_e)
     dist_vh_q_vv = np.linalg.norm(vh_q_e - vv_e)
     dist_vh_ref_vv = np.linalg.norm(vh_ref_e - vv_e)
     dist_vh_ref_br = np.linalg.norm(vh_ref_e - br_e)
     dist_vh_q_b = np.linalg.norm(vh_q_e - b_e)
+    dist_v_tr = np.linalg.norm(vv_e - tr_e)
+    dist_v_t = np.linalg.norm(vv_e - t_e)
 
-    if dist_tr_br < 1e-12 or dist_vh_ref_vv < 1e-12 or dist_vh_q_b < 1e-12:
+    if (
+        dist_tr_br < 1e-12
+        or dist_vh_ref_vv < 1e-12
+        or dist_vh_q_b < 1e-12
+        or dist_v_t < 1e-12
+    ):
         raise ValueError("Degenerate configuration for height measurement.")
 
     return float(
@@ -711,6 +750,7 @@ def _cross_ratio_height(
         * (dist_tb / dist_tr_br)
         * (dist_vh_q_vv / dist_vh_ref_vv)
         * (dist_vh_ref_br / dist_vh_q_b)
+        * (dist_v_tr / dist_v_t)
     )
 
 
@@ -765,11 +805,18 @@ def measure_height_single_view(
            }{
                \lVert \mathbf{v}_q - \mathbf{b} \rVert
            }
+           \;\cdot\;
+           \frac{
+               \lVert \mathbf{v} - \mathbf{t}_r \rVert
+           }{
+               \lVert \mathbf{v} - \mathbf{t} \rVert
+           }
 
-       This expression is derived from the invariance of the
-       cross-ratio :math:`\operatorname{CR}(B, T, V_h, V)` where
-       :math:`V_h` is the horizon intercept and :math:`V` is the
-       vertical vanishing point.
+       The first three factors come from the invariance of the
+       cross-ratio :math:`\operatorname{CR}(B, T, V_h, V)` — where
+       :math:`V_h` is the horizon intercept and :math:`V` the vertical
+       vanishing point — applied to both objects; the last factor
+       accounts for the different depths of the two vertical lines.
 
     Parameters
     ----------
@@ -806,8 +853,11 @@ def measure_height_single_view(
 
     return _cross_ratio_height(
         reference_height,
-        _to_euclidean_2d(b), _to_euclidean_2d(t),
-        _to_euclidean_2d(br), _to_euclidean_2d(tr),
+        _to_euclidean_2d(b),
+        _to_euclidean_2d(t),
+        _to_euclidean_2d(br),
+        _to_euclidean_2d(tr),
         _to_euclidean_2d(vv),
-        _to_euclidean_2d(vh_ref), _to_euclidean_2d(vh_q),
+        _to_euclidean_2d(vh_ref),
+        _to_euclidean_2d(vh_q),
     )
