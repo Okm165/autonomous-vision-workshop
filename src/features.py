@@ -33,21 +33,28 @@ References
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from . import _cv
 
 # ======================================================================
 #  Type aliases
 # ======================================================================
 Image = NDArray[np.uint8]
+# Public entry points accept any image OpenCV can produce (``imread`` returns
+# ``MatLike``) and normalise internally via ``_ensure_gray_u8``.
+ImageLike = cv2.typing.MatLike
 FloatImage = NDArray[np.floating]
-Points = NDArray[np.floating]       # (N, 2) array of 2-D points
-Mat3 = NDArray[np.floating]         # 3 × 3 matrix
+Points = NDArray[np.floating]  # (N, 2) array of 2-D points
+Mat3 = NDArray[np.floating]  # 3 × 3 matrix
+# Feature descriptors are float32 for SIFT-like detectors and uint8 for binary
+# (ORB/BRIEF) ones, so the matching routines accept either.
+Descriptors = NDArray[np.floating | np.unsignedinteger]
 
 
 @dataclass
@@ -73,6 +80,7 @@ class MatchPair:
 #  1. Harris Corner Detection  (from scratch)
 # ======================================================================
 
+
 def _gaussian_kernel(size: int, sigma: float) -> NDArray[np.float64]:
     """Return a normalised 2-D Gaussian kernel.
 
@@ -90,20 +98,18 @@ def _gaussian_kernel(size: int, sigma: float) -> NDArray[np.float64]:
     """
     ax = np.arange(size) - size // 2
     xx, yy = np.meshgrid(ax, ax)
-    kernel = np.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2))
+    kernel = np.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
     return kernel / kernel.sum()
 
 
 def _compute_sobel_gradients(
     img: NDArray[np.float64],
-) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Compute Sobel spatial gradients Ix, Iy."""
-    sobel_x = np.array([[-1, 0, 1],
-                        [-2, 0, 2],
-                        [-1, 0, 1]], dtype=np.float64)
+    sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64)
     Ix = cv2.filter2D(img, cv2.CV_64F, sobel_x)
     Iy = cv2.filter2D(img, cv2.CV_64F, sobel_x.T)
-    return Ix, Iy
+    return np.asarray(Ix, dtype=np.float64), np.asarray(Iy, dtype=np.float64)
 
 
 def _compute_structure_tensor_maps(
@@ -111,13 +117,17 @@ def _compute_structure_tensor_maps(
     Iy: NDArray[np.float64],
     window_size: int,
     sigma: float,
-) -> Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     """Gaussian-weighted structure tensor components (Sxx, Sxy, Syy)."""
     G = _gaussian_kernel(window_size, sigma)
     Sxx = cv2.filter2D(Ix * Ix, cv2.CV_64F, G)
     Sxy = cv2.filter2D(Ix * Iy, cv2.CV_64F, G)
     Syy = cv2.filter2D(Iy * Iy, cv2.CV_64F, G)
-    return Sxx, Sxy, Syy
+    return (
+        np.asarray(Sxx, dtype=np.float64),
+        np.asarray(Sxy, dtype=np.float64),
+        np.asarray(Syy, dtype=np.float64),
+    )
 
 
 def _harris_response(
@@ -129,7 +139,7 @@ def _harris_response(
     """Corner response R = det(M) - k * trace(M)**2."""
     det_M = Sxx * Syy - Sxy * Sxy
     trace_M = Sxx + Syy
-    return det_M - k * (trace_M ** 2)
+    return det_M - k * (trace_M**2)
 
 
 def _extract_keypoints_nms(
@@ -137,39 +147,43 @@ def _extract_keypoints_nms(
     threshold: float,
     nms_size: int,
     window_size: int,
-) -> List[cv2.KeyPoint]:
+) -> list[cv2.KeyPoint]:
     """Threshold the response map and apply non-maximum suppression."""
     R_thresh = R.copy()
-    R_thresh[R < threshold * R.max()] = 0
+    R_thresh[threshold * R.max() > R] = 0
 
     half = nms_size // 2
     pad_R = np.pad(R_thresh, half, mode="constant", constant_values=0)
 
-    keypoints: List[cv2.KeyPoint] = []
+    keypoints: list[cv2.KeyPoint] = []
     h, w = R_thresh.shape
     for y in range(h):
         for x in range(w):
             val = R_thresh[y, x]
             if val == 0:
                 continue
-            local = pad_R[y: y + nms_size, x: x + nms_size]
+            local = pad_R[y : y + nms_size, x : x + nms_size]
             if val >= local.max():
                 keypoints.append(
-                    cv2.KeyPoint(x=float(x), y=float(y), size=float(window_size),
-                                 response=float(val))
+                    cv2.KeyPoint(
+                        x=float(x),
+                        y=float(y),
+                        size=float(window_size),
+                        response=float(val),
+                    )
                 )
     return keypoints
 
 
 def harris_corners(
-    image: NDArray,
+    image: ImageLike,
     k: float = 0.04,
     threshold: float = 0.01,
     window_size: int = 5,
     *,
     sigma: float = 1.0,
     nms_size: int = 7,
-) -> Tuple[NDArray[np.float64], List[cv2.KeyPoint]]:
+) -> tuple[NDArray[np.float64], list[cv2.KeyPoint]]:
     r"""Harris corner detector implemented from scratch.
 
     **Structure tensor** *M* at each pixel:
@@ -236,10 +250,11 @@ def harris_corners(
 #  2. ORB Detection (wrapper)
 # ======================================================================
 
+
 def detect_orb(
-    image: NDArray,
+    image: ImageLike,
     n_features: int = 500,
-) -> Tuple[List[cv2.KeyPoint], NDArray[np.uint8]]:
+) -> tuple[list[cv2.KeyPoint], NDArray[np.uint8]]:
     """Detect ORB features.
 
     ORB = FAST keypoints + oriented BRIEF descriptors [3].
@@ -266,21 +281,24 @@ def detect_orb(
         256-bit binary descriptors packed into 32 bytes per feature.
     """
     gray = _ensure_gray_u8(image)
-    orb = cv2.ORB_create(nfeatures=n_features)
+    orb = _cv.orb_create(n_features)
     kp, desc = orb.detectAndCompute(gray, None)
-    if desc is None:
-        desc = np.empty((0, 32), dtype=np.uint8)
-    return list(kp), desc
+    # ``detectAndCompute`` returns ``None`` for a textureless image, which the
+    # stub does not model (it types the output as an always-present MatLike).
+    if _cv.is_absent(desc):
+        return list(kp), np.empty((0, 32), dtype=np.uint8)
+    return list(kp), np.ascontiguousarray(desc, dtype=np.uint8)
 
 
 # ======================================================================
 #  3. SIFT Detection (wrapper)
 # ======================================================================
 
+
 def detect_sift(
-    image: NDArray,
+    image: ImageLike,
     n_features: int = 500,
-) -> Tuple[List[cv2.KeyPoint], NDArray[np.float32]]:
+) -> tuple[list[cv2.KeyPoint], NDArray[np.float32]]:
     r"""Detect SIFT features [2].
 
     **Scale-space extrema detection**: build a Gaussian scale space
@@ -306,22 +324,25 @@ def detect_sift(
     descriptors : ndarray of float32, shape ``(N, 128)``
     """
     gray = _ensure_gray_u8(image)
-    sift = cv2.SIFT_create(nfeatures=n_features)
+    sift = _cv.sift_create(n_features)
     kp, desc = sift.detectAndCompute(gray, None)
-    if desc is None:
-        desc = np.empty((0, 128), dtype=np.float32)
-    return list(kp), desc
+    # See ``detect_orb``: an absent descriptor set is a legitimate outcome that
+    # the stub does not model.
+    if _cv.is_absent(desc):
+        return list(kp), np.empty((0, 128), dtype=np.float32)
+    return list(kp), np.ascontiguousarray(desc, dtype=np.float32)
 
 
 # ======================================================================
 #  4. Matching
 # ======================================================================
 
+
 def match_bruteforce(
-    desc1: NDArray,
-    desc2: NDArray,
+    desc1: Descriptors,
+    desc2: Descriptors,
     norm_type: str = "L2",
-) -> List[List[MatchPair]]:
+) -> list[list[MatchPair]]:
     """Brute-force k-NN matching (k = 2).
 
     For every descriptor in *desc1*, the two nearest neighbours in
@@ -345,15 +366,14 @@ def match_bruteforce(
     bf = cv2.BFMatcher(norms[norm_type])
     raw = bf.knnMatch(desc1, desc2, k=2)
     return [
-        [MatchPair(m.queryIdx, m.trainIdx, m.distance) for m in group]
-        for group in raw
+        [MatchPair(m.queryIdx, m.trainIdx, m.distance) for m in group] for group in raw
     ]
 
 
 def match_flann(
-    desc1: NDArray,
-    desc2: NDArray,
-) -> List[List[MatchPair]]:
+    desc1: Descriptors,
+    desc2: Descriptors,
+) -> list[list[MatchPair]]:
     """FLANN-based approximate k-NN matching (k = 2).
 
     Uses a KD-tree index for float descriptors (SIFT) or an LSH index
@@ -371,30 +391,32 @@ def match_flann(
     list[list[MatchPair]]
         k-NN matches (k = 2) for each query descriptor.
     """
+    # ``cv2.typing.IndexParams`` / ``SearchParams`` are ``dict[str, bool | int |
+    # float | str]``.  ``dict`` is invariant in its value type, so the literals
+    # must be annotated with the full union for the invariance to be satisfied.
+    index_params: cv2.typing.IndexParams
     if desc1.dtype == np.float32:
-        index_params = dict(algorithm=1, trees=5)  # FLANN_INDEX_KDTREE
-        search_params = dict(checks=50)
+        index_params = {"algorithm": 1, "trees": 5}  # FLANN_INDEX_KDTREE
     else:
-        index_params = dict(
-            algorithm=6,          # FLANN_INDEX_LSH
-            table_number=6,
-            key_size=12,
-            multi_probe_level=1,
-        )
-        search_params = dict(checks=50)
+        index_params = {
+            "algorithm": 6,  # FLANN_INDEX_LSH
+            "table_number": 6,
+            "key_size": 12,
+            "multi_probe_level": 1,
+        }
+    search_params: cv2.typing.SearchParams = {"checks": 50}
 
     flann = cv2.FlannBasedMatcher(index_params, search_params)
     raw = flann.knnMatch(desc1, desc2, k=2)
     return [
-        [MatchPair(m.queryIdx, m.trainIdx, m.distance) for m in group]
-        for group in raw
+        [MatchPair(m.queryIdx, m.trainIdx, m.distance) for m in group] for group in raw
     ]
 
 
 def ratio_test(
-    matches: List[List[MatchPair]],
+    matches: list[list[MatchPair]],
     ratio: float = 0.75,
-) -> List[MatchPair]:
+) -> list[MatchPair]:
     """Apply Lowe's ratio test to k-NN matches.
 
     For each pair of candidate matches :math:`(m_1, m_2)`:
@@ -419,7 +441,7 @@ def ratio_test(
     list[MatchPair]
         Filtered best matches.
     """
-    good: List[MatchPair] = []
+    good: list[MatchPair] = []
     for group in matches:
         if len(group) < 2:
             continue
@@ -430,10 +452,10 @@ def ratio_test(
 
 
 def cross_check_matches(
-    desc1: NDArray,
-    desc2: NDArray,
+    desc1: Descriptors,
+    desc2: Descriptors,
     norm_type: str = "L2",
-) -> List[MatchPair]:
+) -> list[MatchPair]:
     """Mutual (cross-check) matching.
 
     A match :math:`(i, j)` is kept only when descriptor *i* in set 1 is
@@ -461,13 +483,14 @@ def cross_check_matches(
 #  5. RANSAC for Fundamental Matrix
 # ======================================================================
 
+
 def ransac_fundamental(
     pts1: Points,
     pts2: Points,
     threshold: float = 3.0,
     max_iters: int = 2000,
     confidence: float = 0.99,
-) -> Tuple[Mat3, NDArray[np.bool_]]:
+) -> tuple[Mat3, NDArray[np.bool_]]:
     r"""RANSAC estimation of the fundamental matrix.
 
     1. Randomly sample 8 correspondences.
@@ -511,7 +534,7 @@ def ransac_fundamental(
     """
     N = pts1.shape[0]
     s = 8
-    if N < s:
+    if s > N:
         raise ValueError(f"Need at least {s} correspondences, got {N}")
 
     best_F = np.eye(3)
@@ -542,16 +565,12 @@ def ransac_fundamental(
                 break
             denom = np.log(1.0 - (1.0 - epsilon) ** s)
             if denom < 0:
-                adaptive_iters = int(
-                    np.ceil(np.log(1.0 - confidence) / denom)
-                )
+                adaptive_iters = int(np.ceil(np.log(1.0 - confidence) / denom))
                 adaptive_iters = min(adaptive_iters, max_iters)
 
     # re-estimate from all inliers for better accuracy
     if best_count >= s:
-        best_F = compute_fundamental_8point(
-            pts1[best_inliers], pts2[best_inliers]
-        )
+        best_F = compute_fundamental_8point(pts1[best_inliers], pts2[best_inliers])
         best_inliers = _sampson_inliers(best_F, pts1, pts2, threshold)
 
     return best_F, best_inliers
@@ -568,22 +587,22 @@ def _sampson_inliers(
     p1h = np.hstack([pts1, ones])  # (N, 3)
     p2h = np.hstack([pts2, ones])
 
-    Fp1 = (F @ p1h.T).T            # (N, 3)
-    Ftp2 = (F.T @ p2h.T).T         # (N, 3)
+    Fp1 = (F @ p1h.T).T  # (N, 3)
+    Ftp2 = (F.T @ p2h.T).T  # (N, 3)
 
     # x'ᵀ F x  (epipolar constraint, scalar per point)
     num = np.sum(p2h * Fp1, axis=1) ** 2
 
-    denom = (Fp1[:, 0] ** 2 + Fp1[:, 1] ** 2 +
-             Ftp2[:, 0] ** 2 + Ftp2[:, 1] ** 2)
+    denom = Fp1[:, 0] ** 2 + Fp1[:, 1] ** 2 + Ftp2[:, 0] ** 2 + Ftp2[:, 1] ** 2
 
     sampson_sq = num / np.maximum(denom, 1e-12)
-    return sampson_sq < threshold ** 2
+    return sampson_sq < threshold**2
 
 
 # ======================================================================
 #  6. Fundamental Matrix — normalised 8-point algorithm
 # ======================================================================
+
 
 def compute_fundamental_8point(pts1: Points, pts2: Points) -> Mat3:
     r"""Normalised 8-point algorithm for the fundamental matrix [4, §11.2].
@@ -641,11 +660,19 @@ def compute_fundamental_8point(pts1: Points, pts2: Points) -> Mat3:
     # 2. Build constraint matrix  A · vec(F) = 0
     x, y = p1[:, 0], p1[:, 1]
     xp, yp = p2[:, 0], p2[:, 1]
-    A = np.column_stack([
-        xp * x, xp * y, xp,
-        yp * x, yp * y, yp,
-        x,      y,      np.ones_like(x),
-    ])
+    A = np.column_stack(
+        [
+            xp * x,
+            xp * y,
+            xp,
+            yp * x,
+            yp * y,
+            yp,
+            x,
+            y,
+            np.ones_like(x),
+        ]
+    )
 
     # 3. SVD → F̃ is last column of V
     _, _, Vt = np.linalg.svd(A)
@@ -666,7 +693,7 @@ def compute_fundamental_8point(pts1: Points, pts2: Points) -> Mat3:
 
 def _hartley_normalise(
     pts: Points,
-) -> Tuple[NDArray[np.float64], Mat3]:
+) -> tuple[NDArray[np.float64], Mat3]:
     r"""Translate + isotropic scale so mean distance from origin = √2.
 
     Returns
@@ -680,11 +707,14 @@ def _hartley_normalise(
     mean_dist = np.mean(np.linalg.norm(shifted, axis=1))
     scale = np.sqrt(2.0) / max(mean_dist, 1e-12)
 
-    T = np.array([
-        [scale, 0,     -scale * centroid[0]],
-        [0,     scale, -scale * centroid[1]],
-        [0,     0,     1],
-    ], dtype=np.float64)
+    T = np.array(
+        [
+            [scale, 0, -scale * centroid[0]],
+            [0, scale, -scale * centroid[1]],
+            [0, 0, 1],
+        ],
+        dtype=np.float64,
+    )
 
     pts_norm = shifted * scale
     return pts_norm, T
@@ -694,10 +724,11 @@ def _hartley_normalise(
 #  7. Essential Matrix
 # ======================================================================
 
+
 def compute_essential(
     F: Mat3,
     K1: Mat3,
-    K2: Optional[Mat3] = None,
+    K2: Mat3 | None = None,
 ) -> Mat3:
     r"""Compute the essential matrix from *F* and intrinsics.
 
@@ -733,7 +764,7 @@ def compute_essential(
 
 def decompose_essential(
     E: Mat3,
-) -> List[Tuple[NDArray[np.float64], NDArray[np.float64]]]:
+) -> list[tuple[NDArray[np.float64], NDArray[np.float64]]]:
     r"""Decompose the essential matrix into four (R, t) hypotheses.
 
     Given :math:`E = U \, \Sigma \, V^{\!\top}`:
@@ -772,9 +803,7 @@ def decompose_essential(
     if np.linalg.det(Vt) < 0:
         Vt[-1, :] *= -1
 
-    W = np.array([[0, -1, 0],
-                  [1,  0, 0],
-                  [0,  0, 1]], dtype=np.float64)
+    W = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=np.float64)
 
     R1 = U @ W @ Vt
     R2 = U @ W.T @ Vt
@@ -789,7 +818,7 @@ def choose_pose_cheirality(
     pts1: Points,
     pts2: Points,
     K: Mat3,
-) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     r"""Select the correct (R, t) via the **cheirality check**.
 
     Among the four decompositions of *E*, only one places the
@@ -815,7 +844,7 @@ def choose_pose_cheirality(
     best_count = -1
     best_R, best_t = R_list[0], t_list[0]
 
-    for R, t in zip(R_list, t_list):
+    for R, t in zip(R_list, t_list, strict=False):
         P2 = K @ np.hstack([R, t.reshape(3, 1)])
         X = triangulate_dlt(pts1, pts2, P1, P2)
 
@@ -836,6 +865,7 @@ def choose_pose_cheirality(
 # ======================================================================
 #  8. Triangulation (DLT)
 # ======================================================================
+
 
 def triangulate_dlt(
     pts1: Points,
@@ -883,12 +913,14 @@ def triangulate_dlt(
         x1, y1 = pts1[i]
         x2, y2 = pts2[i]
 
-        A = np.array([
-            x1 * P1[2] - P1[0],
-            y1 * P1[2] - P1[1],
-            x2 * P2[2] - P2[0],
-            y2 * P2[2] - P2[1],
-        ])
+        A = np.array(
+            [
+                x1 * P1[2] - P1[0],
+                y1 * P1[2] - P1[1],
+                x2 * P2[2] - P2[0],
+                y2 * P2[2] - P2[1],
+            ]
+        )
 
         _, _, Vt = np.linalg.svd(A)
         X = Vt[-1]
@@ -900,6 +932,7 @@ def triangulate_dlt(
 # ======================================================================
 #  9. Visualisation helpers
 # ======================================================================
+
 
 def draw_matches(
     img1: Image,
@@ -926,13 +959,14 @@ def draw_matches(
         Concatenated side-by-side visualisation.
     """
     sorted_matches = sorted(matches, key=lambda m: m.distance)[:max_draw]
-    dm = [
-        cv2.DMatch(m.query_idx, m.train_idx, m.distance)
-        for m in sorted_matches
-    ]
-    vis = cv2.drawMatches(
-        img1, kp1, img2, kp2, dm, None,
-        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
+    dm = [cv2.DMatch(m.query_idx, m.train_idx, m.distance) for m in sorted_matches]
+    vis = _cv.draw_matches(
+        img1,
+        kp1,
+        img2,
+        kp2,
+        dm,
+        _cv.draw_matches_single_point_flag(),
     )
     return vis
 
@@ -941,7 +975,7 @@ def draw_epipolar_lines(
     img: Image,
     F: Mat3,
     pts: Points,
-    color: Optional[Tuple[int, int, int]] = None,
+    color: tuple[int, int, int] | None = None,
     *,
     from_image: int = 1,
 ) -> Image:
@@ -986,19 +1020,13 @@ def draw_epipolar_lines(
     ones = np.ones((pts.shape[0], 1))
     pts_h = np.hstack([pts, ones])  # (N, 3)
 
-    if from_image == 1:
-        lines = (F @ pts_h.T).T
-    else:
-        lines = (F.T @ pts_h.T).T
+    lines = (F @ pts_h.T).T if from_image == 1 else (F.T @ pts_h.T).T
 
     rng = np.random.default_rng(42)
 
     for line in lines:
         a, b, c = line
-        if color is None:
-            clr = tuple(rng.integers(0, 255, size=3).tolist())
-        else:
-            clr = color
+        clr = tuple(rng.integers(0, 255, size=3).tolist()) if color is None else color
 
         # two points on the line: x = 0 and x = w
         if abs(b) > 1e-8:
@@ -1008,17 +1036,21 @@ def draw_epipolar_lines(
             y0, y1 = 0, h
         cv2.line(vis, (0, y0), (w, y1), clr, 1, cv2.LINE_AA)
 
-    return vis
+    return np.asarray(vis, dtype=np.uint8)
 
 
 # ======================================================================
 #  Learned feature detection & matching (GPU optional)
 # ======================================================================
 
+
 def detect_superpoint(
-    image: NDArray,
+    image: ImageLike,
     max_keypoints: int = 1024,
-) -> tuple[NDArray, NDArray]:
+) -> (
+    tuple[list[cv2.KeyPoint], NDArray[np.float32]]
+    | tuple[NDArray[np.float32], NDArray[np.float32]]
+):
     """Detect SuperPoint keypoints and descriptors.
 
     SuperPoint (DeTone et al. 2018) is a self-supervised CNN that jointly
@@ -1038,18 +1070,21 @@ def detect_superpoint(
     descriptors : (N, 256) array of float descriptors
     """
     try:
-        import torch
-        from transformers import AutoModel, AutoImageProcessor
+        import torch  # pyright: ignore[reportMissingImports]
+        from transformers import (  # pyright: ignore[reportMissingImports]
+            AutoImageProcessor,
+            AutoModel,
+        )
     except ImportError:
         import warnings
-        warnings.warn("transformers not available — falling back to SIFT.")
+
+        warnings.warn(
+            "transformers not available — falling back to SIFT.", stacklevel=2
+        )
         kps, descs = detect_sift(image, n_features=max_keypoints)
         return kps, descs
 
-    if image.ndim == 2:
-        image_rgb = np.stack([image, image, image], axis=-1)
-    else:
-        image_rgb = image
+    image_rgb = np.stack([image, image, image], axis=-1) if image.ndim == 2 else image
 
     try:
         processor = AutoImageProcessor.from_pretrained(
@@ -1060,13 +1095,18 @@ def detect_superpoint(
         )
     except Exception:
         import warnings
-        warnings.warn("SuperPoint model not available — falling back to SIFT.")
+
+        warnings.warn(
+            "SuperPoint model not available — falling back to SIFT.", stacklevel=2
+        )
         kps, descs = detect_sift(image, n_features=max_keypoints)
         return kps, descs
 
     from PIL import Image as PILImage
-    pil_img = PILImage.fromarray(image_rgb if image_rgb.dtype == np.uint8
-                                  else (image_rgb * 255).astype(np.uint8))
+
+    pil_img = PILImage.fromarray(
+        image_rgb if image_rgb.dtype == np.uint8 else (image_rgb * 255).astype(np.uint8)
+    )
     inputs = processor(pil_img, return_tensors="pt")
 
     with torch.no_grad():
@@ -1084,10 +1124,10 @@ def detect_superpoint(
 
 
 def match_lightglue(
-    kps1: NDArray,
-    desc1: NDArray,
-    kps2: NDArray,
-    desc2: NDArray,
+    kps1: NDArray[np.float64],
+    desc1: NDArray[np.floating],
+    kps2: NDArray[np.float64],
+    desc2: NDArray[np.floating],
 ) -> list[tuple[int, int]]:
     """Match features using LightGlue (or mutual nearest neighbour fallback).
 
@@ -1112,6 +1152,7 @@ def match_lightglue(
     desc2 = desc2.astype(np.float32)
 
     from scipy.spatial.distance import cdist
+
     dists = cdist(desc1, desc2, metric="cosine")
 
     nn12 = np.argmin(dists, axis=1)
@@ -1137,7 +1178,8 @@ compute_essential_matrix = compute_essential
 #  Internal helpers
 # ======================================================================
 
-def _ensure_gray_u8(image: NDArray) -> NDArray[np.uint8]:
+
+def _ensure_gray_u8(image: ImageLike) -> NDArray[np.uint8]:
     """Convert an image to single-channel uint8 if needed."""
     if image.ndim == 3 and image.shape[2] == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -1148,17 +1190,17 @@ def _ensure_gray_u8(image: NDArray) -> NDArray[np.uint8]:
             gray = (gray * 255).astype(np.uint8)
         else:
             gray = gray.astype(np.uint8)
-    return gray
+    return np.asarray(gray, dtype=np.uint8)
 
 
 ransac_filter = ransac_fundamental
 
 
 def bf_match(
-    desc1: NDArray,
-    desc2: NDArray,
+    desc1: Descriptors,
+    desc2: Descriptors,
     norm_type: int = cv2.NORM_L2,
-) -> List[List[MatchPair]]:
+) -> list[list[MatchPair]]:
     """Brute-force k-NN matching accepting cv2 norm constants."""
     _norm_map = {cv2.NORM_L2: "L2", cv2.NORM_HAMMING: "HAMMING"}
     return match_bruteforce(desc1, desc2, norm_type=_norm_map.get(norm_type, "L2"))

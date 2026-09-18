@@ -28,10 +28,33 @@ References
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from typing import Protocol
 
 import cv2
+import cv2.typing
 import numpy as np
+
+from . import _cv
+from ._cv import find_essential_matrix
+
+
+class _DescriptorDetector(Protocol):
+    """Structural type for OpenCV feature detectors.
+
+    ``cv2.Feature2D.detectAndCompute`` returns ``None`` descriptors when no
+    keypoints are found, but the shipped stubs type them as always present.
+    Declaring the real contract here lets call sites branch on ``None``
+    honestly, mirroring the wrappers in :mod:`._cv`.
+    """
+
+    def detectAndCompute(
+        self,
+        image: cv2.typing.MatLike,
+        mask: cv2.typing.MatLike | None,
+        descriptors: cv2.typing.MatLike | None = ...,
+        useProvidedKeypoints: bool = ...,
+    ) -> tuple[Sequence[cv2.KeyPoint], cv2.typing.MatLike | None]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -123,30 +146,32 @@ class MonocularVO:
         History of camera positions (translation component of each pose).
     """
 
+    _detector: _DescriptorDetector
+    _norm_type: int
+    _bf: cv2.BFMatcher
+
     def __init__(self, K: np.ndarray, detector: str = "orb") -> None:
         """Initialise the monocular VO pipeline with intrinsics and detector."""
         self.K: np.ndarray = np.asarray(K, dtype=np.float64)
         self.detector_name: str = detector.lower()
 
         if self.detector_name == "orb":
-            self._detector = cv2.ORB_create(nfeatures=2000)
+            self._detector = _cv.orb_create(n_features=2000)
             self._norm_type = cv2.NORM_HAMMING
         elif self.detector_name == "sift":
-            self._detector = cv2.SIFT_create(nfeatures=2000)
+            self._detector = _cv.sift_create(n_features=2000)
             self._norm_type = cv2.NORM_L2
         else:
-            raise ValueError(
-                f"Unknown detector '{detector}'; choose 'orb' or 'sift'."
-            )
+            raise ValueError(f"Unknown detector '{detector}'; choose 'orb' or 'sift'.")
 
         self._bf = cv2.BFMatcher(self._norm_type)
 
         self.pose: np.ndarray = np.eye(4, dtype=np.float64)
-        self.trajectory: List[np.ndarray] = [np.zeros(3)]
+        self.trajectory: list[np.ndarray] = [np.zeros(3)]
 
-        self._prev_frame: Optional[np.ndarray] = None
-        self._prev_kp: Optional[Sequence[cv2.KeyPoint]] = None
-        self._prev_des: Optional[np.ndarray] = None
+        self._prev_frame: np.ndarray | None = None
+        self._prev_kp: Sequence[cv2.KeyPoint] | None = None
+        self._prev_des: cv2.typing.MatLike | None = None
         self._frame_count: int = 0
 
     # ------------------------------------------------------------------
@@ -195,8 +220,13 @@ class MonocularVO:
             self._frame_count += 1
             return self.pose.copy()
 
+        assert self._prev_kp is not None, "previous keypoints missing"
+
         pts1, pts2 = self._match_features(
-            self._prev_kp, self._prev_des, kp, des,
+            self._prev_kp,
+            self._prev_des,
+            kp,
+            des,
         )
 
         if len(pts1) < 8:
@@ -206,7 +236,7 @@ class MonocularVO:
             self._frame_count += 1
             return self.pose.copy()
 
-        R, t, mask = self._estimate_motion(pts1, pts2)
+        R, t, _mask = self._estimate_motion(pts1, pts2)
 
         # recoverPose returns cam_prev→cam_curr; invert for camera-to-world accumulation
         T_rel = np.eye(4, dtype=np.float64)
@@ -262,7 +292,7 @@ class MonocularVO:
         kp2: Sequence[cv2.KeyPoint],
         des2: np.ndarray,
         ratio_thresh: float = 0.75,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         r"""Brute-force match with Lowe's ratio test.
 
         For each descriptor in image 1 the two nearest neighbours in image 2
@@ -280,7 +310,7 @@ class MonocularVO:
         """
         raw_matches = self._bf.knnMatch(des1, des2, k=2)
 
-        good: List[cv2.DMatch] = []
+        good: list[cv2.DMatch] = []
         for m_pair in raw_matches:
             if len(m_pair) == 2:
                 m, n = m_pair
@@ -290,15 +320,15 @@ class MonocularVO:
         if not good:
             return np.empty((0, 2)), np.empty((0, 2))
 
-        pts1 = np.float64([kp1[m.queryIdx].pt for m in good])
-        pts2 = np.float64([kp2[m.trainIdx].pt for m in good])
+        pts1 = np.asarray([kp1[m.queryIdx].pt for m in good], dtype=np.float64)
+        pts2 = np.asarray([kp2[m.trainIdx].pt for m in good], dtype=np.float64)
         return pts1, pts2
 
     def _estimate_motion(
         self,
         pts1: np.ndarray,
         pts2: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
         r"""Recover relative rotation and unit translation from matched points.
 
         Uses the 5-point algorithm inside RANSAC (``cv2.findEssentialMat``)
@@ -308,12 +338,9 @@ class MonocularVO:
 
         Returns ``(R, t, inlier_mask)``.
         """
-        E, mask_e = cv2.findEssentialMat(
-            pts1, pts2, self.K,
-            method=cv2.RANSAC,
-            prob=0.999,
-            threshold=1.0,
-        )
+        # ``findEssentialMat`` returns ``(None, None)`` instead of raising when
+        # the sample is degenerate (collinear / too few points).
+        E, mask_e = find_essential_matrix(pts1, pts2, self.K)
 
         if E is None:
             return np.eye(3), np.zeros((3, 1)), None
@@ -389,6 +416,10 @@ class StereoVO:
         History of camera positions.
     """
 
+    _detector: _DescriptorDetector
+    _bf: cv2.BFMatcher
+    _stereo: cv2.StereoSGBM
+
     def __init__(self, K: np.ndarray, baseline: float) -> None:
         """Initialise stereo VO with intrinsics and baseline distance."""
         self.K: np.ndarray = np.asarray(K, dtype=np.float64)
@@ -399,36 +430,36 @@ class StereoVO:
         self._cx: float = float(self.K[0, 2])
         self._cy: float = float(self.K[1, 2])
 
-        self._detector = cv2.ORB_create(nfeatures=2000)
+        self._detector = _cv.orb_create(n_features=2000)
         self._bf = cv2.BFMatcher(cv2.NORM_HAMMING)
 
-        self._stereo = cv2.StereoSGBM_create(
-            minDisparity=0,
-            numDisparities=128,
-            blockSize=5,
-            P1=8 * 3 * 5 * 5,
-            P2=32 * 3 * 5 * 5,
-            disp12MaxDiff=1,
-            uniquenessRatio=10,
-            speckleWindowSize=100,
-            speckleRange=32,
+        self._stereo = _cv.stereosgbm_create(
+            min_disparity=0,
+            num_disparities=128,
+            block_size=5,
+            p1=8 * 3 * 5 * 5,
+            p2=32 * 3 * 5 * 5,
+            disp12_max_diff=1,
+            uniqueness_ratio=10,
+            speckle_window_size=100,
+            speckle_range=32,
+            pre_filter_cap=63,
+            mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
         )
 
         self.pose: np.ndarray = np.eye(4, dtype=np.float64)
-        self.trajectory: List[np.ndarray] = [np.zeros(3)]
+        self.trajectory: list[np.ndarray] = [np.zeros(3)]
 
-        self._prev_left: Optional[np.ndarray] = None
-        self._prev_kp: Optional[Sequence[cv2.KeyPoint]] = None
-        self._prev_des: Optional[np.ndarray] = None
-        self._prev_pts3d: Optional[np.ndarray] = None
+        self._prev_left: np.ndarray | None = None
+        self._prev_kp: Sequence[cv2.KeyPoint] | None = None
+        self._prev_des: cv2.typing.MatLike | None = None
+        self._prev_pts3d: np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
 
-    def process_frame(
-        self, left: np.ndarray, right: np.ndarray
-    ) -> np.ndarray:
+    def process_frame(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
         r"""Process a rectified stereo pair and return the current pose.
 
         Parameters
@@ -454,16 +485,22 @@ class StereoVO:
             self._update_state(gray_l, kp, des, pts3d)
             return self.pose.copy()
 
+        assert self._prev_kp is not None, "previous keypoints missing"
+
         idx_prev, idx_curr = self._match_features(
-            self._prev_kp, self._prev_des, kp, des,
+            self._prev_kp,
+            self._prev_des,
+            kp,
+            des,
         )
 
         if len(idx_prev) < 6:
             self._update_state(gray_l, kp, des, pts3d)
             return self.pose.copy()
 
+        assert self._prev_pts3d is not None, "previous 3-D points missing"
         obj_pts = self._prev_pts3d[idx_prev]
-        img_pts = np.float64([kp[i].pt for i in idx_curr])
+        img_pts = np.asarray([kp[i].pt for i in idx_curr], dtype=np.float64)
 
         valid = np.isfinite(obj_pts).all(axis=1)
         obj_pts = obj_pts[valid]
@@ -473,7 +510,7 @@ class StereoVO:
             self._update_state(gray_l, kp, des, pts3d)
             return self.pose.copy()
 
-        ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+        ok, rvec, tvec, _inliers = cv2.solvePnPRansac(
             obj_pts.astype(np.float64),
             img_pts.astype(np.float64),
             self.K,
@@ -515,9 +552,7 @@ class StereoVO:
             return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         return img
 
-    def _compute_disparity(
-        self, left: np.ndarray, right: np.ndarray
-    ) -> np.ndarray:
+    def _compute_disparity(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
         r"""Compute a dense disparity map via semi-global block matching.
 
         SGBM returns disparities scaled by 16 (fixed-point); we convert to
@@ -558,7 +593,7 @@ class StereoVO:
 
         for i, kp in enumerate(keypoints):
             u, v = kp.pt
-            iu, iv = int(round(v)), int(round(u))
+            iu, iv = round(v), round(u)
 
             if 0 <= iu < disparity.shape[0] and 0 <= iv < disparity.shape[1]:
                 d = disparity[iu, iv]
@@ -577,7 +612,7 @@ class StereoVO:
         kp2: Sequence[cv2.KeyPoint],
         des2: np.ndarray,
         ratio_thresh: float = 0.75,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         r"""Brute-force match with Lowe's ratio test.
 
         Returns two arrays of indices into *kp1* and *kp2* respectively,
@@ -585,8 +620,8 @@ class StereoVO:
         """
         raw_matches = self._bf.knnMatch(des1, des2, k=2)
 
-        idx1: List[int] = []
-        idx2: List[int] = []
+        idx1: list[int] = []
+        idx2: list[int] = []
 
         for m_pair in raw_matches:
             if len(m_pair) == 2:
@@ -601,7 +636,7 @@ class StereoVO:
         self,
         gray: np.ndarray,
         kp: Sequence[cv2.KeyPoint],
-        des: Optional[np.ndarray],
+        des: np.ndarray | None,
         pts3d: np.ndarray,
     ) -> None:
         """Store the current frame data for use in the next iteration."""
@@ -621,7 +656,7 @@ def compute_relative_pose(
     kp2: Sequence[cv2.KeyPoint],
     matches: Sequence[cv2.DMatch],
     K: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     r"""Compute the relative pose from matched keypoints.
 
     Extracts pixel coordinates from *kp1* / *kp2* using the query/train
@@ -657,15 +692,10 @@ def compute_relative_pose(
         Per-match inlier flags from ``cv2.recoverPose``.
     """
     K = np.asarray(K, dtype=np.float64)
-    pts1 = np.float64([kp1[m.queryIdx].pt for m in matches])
-    pts2 = np.float64([kp2[m.trainIdx].pt for m in matches])
+    pts1 = np.asarray([kp1[m.queryIdx].pt for m in matches], dtype=np.float64)
+    pts2 = np.asarray([kp2[m.trainIdx].pt for m in matches], dtype=np.float64)
 
-    E, mask_e = cv2.findEssentialMat(
-        pts1, pts2, K,
-        method=cv2.RANSAC,
-        prob=0.999,
-        threshold=1.0,
-    )
+    E, mask_e = find_essential_matrix(pts1, pts2, K)
 
     if E is None:
         return np.eye(3), np.zeros(3), None
@@ -726,7 +756,7 @@ def scale_from_ground_truth(
 def _umeyama_alignment(
     src: np.ndarray,
     dst: np.ndarray,
-) -> Tuple[float, np.ndarray, np.ndarray]:
+) -> tuple[float, np.ndarray, np.ndarray]:
     r"""Umeyama similarity (Sim(3)) alignment of two point sets.
 
     Given *N* corresponding points :math:`\{\mathbf{p}_i\}` (source) and
@@ -807,7 +837,7 @@ def _umeyama_alignment(
     src_c = src - mu_src
     dst_c = dst - mu_dst
 
-    var_src = np.sum(src_c ** 2) / N
+    var_src = np.sum(src_c**2) / N
 
     Sigma = (dst_c.T @ src_c) / N
 
@@ -819,10 +849,7 @@ def _umeyama_alignment(
 
     R = U @ D @ Vt
 
-    if var_src < 1e-15:
-        s = 1.0
-    else:
-        s = float(np.trace(np.diag(S) @ D) / var_src)
+    s = 1.0 if var_src < 1e-15 else float(np.trace(np.diag(S) @ D) / var_src)
 
     t = mu_dst - s * (R @ mu_src)
 
@@ -871,10 +898,12 @@ def compute_trajectory_error(
         ground-truth trajectory.
     """
     est_positions = np.array(
-        [T[:3, 3] for T in estimated_poses], dtype=np.float64,
+        [T[:3, 3] for T in estimated_poses],
+        dtype=np.float64,
     )
     gt_positions = np.array(
-        [T[:3, 3] for T in gt_poses], dtype=np.float64,
+        [T[:3, 3] for T in gt_poses],
+        dtype=np.float64,
     )
 
     assert len(est_positions) == len(gt_positions), (
@@ -886,12 +915,13 @@ def compute_trajectory_error(
     aligned = s * (est_positions @ R.T) + t
 
     errors = np.linalg.norm(gt_positions - aligned, axis=1)
-    return float(np.sqrt(np.mean(errors ** 2)))
+    return float(np.sqrt(np.mean(errors**2)))
 
 
 # ======================================================================
 #  DPVO Wrapper (GPU optional)
 # ======================================================================
+
 
 class DPVOWrapper:
     """Wrapper for DPVO (Deep Patch Visual Odometry).
@@ -909,6 +939,10 @@ class DPVOWrapper:
     device : ``"cuda"`` or ``"cpu"``
     """
 
+    K: np.ndarray
+    device: str
+    _fallback: MonocularVO | None
+
     def __init__(
         self,
         K: np.ndarray,
@@ -921,13 +955,16 @@ class DPVOWrapper:
         self._fallback = None
 
         try:
-            import torch
+            import torch  # pyright: ignore[reportMissingImports]
+
             if not torch.cuda.is_available() and device == "cuda":
                 raise RuntimeError("CUDA not available")
         except (ImportError, RuntimeError):
             import warnings
+
             warnings.warn(
-                "DPVO/torch not available — falling back to classical MonocularVO."
+                "DPVO/torch not available — falling back to classical MonocularVO.",
+                stacklevel=2,
             )
             self._fallback = MonocularVO(K)
 
@@ -958,7 +995,7 @@ class DPVOWrapper:
             return self._fallback.get_trajectory()
         return np.array([T[:3, 3] for T in self._poses])
 
-    def get_poses(self) -> list:
+    def get_poses(self) -> list[np.ndarray]:
         """Return list of 4x4 SE(3) poses.
 
         When using the MonocularVO fallback, full rotation history is

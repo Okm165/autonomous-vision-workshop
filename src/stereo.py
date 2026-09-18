@@ -10,10 +10,10 @@ The stereo depth pipeline:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
-
 import cv2
 import numpy as np
+
+from . import _cv
 
 
 def rectify_stereo_pair(
@@ -25,8 +25,8 @@ def rectify_stereo_pair(
     dist2: np.ndarray,
     R: np.ndarray,
     T: np.ndarray,
-    image_size: Tuple[int, int],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    image_size: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Rectify a stereo pair so epipolar lines are horizontal.
 
@@ -78,15 +78,32 @@ def rectify_stereo_pair(
         ``cv2.reprojectImageTo3D``:
             [X, Y, Z, W]ᵀ = Q · [x, y, d, 1]ᵀ
     """
-    R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
-        K1, dist1, K2, dist2, image_size, R, T, alpha=0,
+    R1, R2, P1, P2, Q, _roi1, _roi2 = cv2.stereoRectify(
+        K1,
+        dist1,
+        K2,
+        dist2,
+        image_size,
+        R,
+        T,
+        alpha=0,
     )
 
     map1x, map1y = cv2.initUndistortRectifyMap(
-        K1, dist1, R1, P1, image_size, cv2.CV_32FC1,
+        K1,
+        dist1,
+        R1,
+        P1,
+        image_size,
+        cv2.CV_32FC1,
     )
     map2x, map2y = cv2.initUndistortRectifyMap(
-        K2, dist2, R2, P2, image_size, cv2.CV_32FC1,
+        K2,
+        dist2,
+        R2,
+        P2,
+        image_size,
+        cv2.CV_32FC1,
     )
 
     rect1 = cv2.remap(img1, map1x, map1y, cv2.INTER_LINEAR)
@@ -148,16 +165,17 @@ def compute_disparity_sgbm(
     p1 = 8 * block_size * block_size
     p2 = 32 * block_size * block_size
 
-    sgbm = cv2.StereoSGBM_create(
-        minDisparity=0,
-        numDisparities=num_disparities,
-        blockSize=block_size,
-        P1=p1,
-        P2=p2,
-        disp12MaxDiff=1,
-        uniquenessRatio=10,
-        speckleWindowSize=100,
-        speckleRange=32,
+    sgbm = _cv.stereosgbm_create(
+        min_disparity=0,
+        num_disparities=num_disparities,
+        block_size=block_size,
+        p1=p1,
+        p2=p2,
+        disp12_max_diff=1,
+        uniqueness_ratio=10,
+        speckle_window_size=100,
+        speckle_range=32,
+        pre_filter_cap=63,
         mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
     )
 
@@ -241,7 +259,7 @@ class StereoDepthEstimator:
         self,
         K: np.ndarray,
         baseline: float,
-        image_size: Tuple[int, int],
+        image_size: tuple[int, int],
         num_disparities: int = 128,
         block_size: int = 5,
     ) -> None:
@@ -261,11 +279,11 @@ class StereoDepthEstimator:
         block_size : int
             SGBM block size.
         """
-        self.K = K.astype(np.float64)
-        self.baseline = baseline
-        self.image_size = image_size
-        self.num_disparities = num_disparities
-        self.block_size = block_size
+        self.K: np.ndarray = K.astype(np.float64)
+        self.baseline: float = baseline
+        self.image_size: tuple[int, int] = image_size
+        self.num_disparities: int = num_disparities
+        self.block_size: int = block_size
 
         self.fx: float = K[0, 0]
         self.fy: float = K[1, 1]
@@ -291,7 +309,8 @@ class StereoDepthEstimator:
             (H, W) float32 depth map in metres.
         """
         disparity = compute_disparity_sgbm(
-            left, right,
+            left,
+            right,
             num_disparities=self.num_disparities,
             block_size=self.block_size,
         )
@@ -302,7 +321,7 @@ class StereoDepthEstimator:
         left: np.ndarray,
         depth: np.ndarray,
         max_depth: float = 50.0,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
         Back-project a depth map into a coloured 3D point cloud.
 
@@ -382,6 +401,8 @@ class StereoDepthEstimator:
         )
         with open(path, "w") as f:
             f.write(header)
-            for pt, c in zip(points, colours):
-                f.write(f"{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f} "
-                        f"{int(c[0])} {int(c[1])} {int(c[2])}\n")
+            for pt, c in zip(points, colours, strict=False):
+                f.write(
+                    f"{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f} "
+                    f"{int(c[0])} {int(c[1])} {int(c[2])}\n"
+                )

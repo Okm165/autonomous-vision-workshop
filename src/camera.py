@@ -22,14 +22,120 @@ References
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from collections.abc import Callable, Sequence
+from typing import Self
 
 import cv2
 import numpy as np
 
+from ._cv import solve_pnp_ransac as _solve_pnp_ransac
+
+#: Generic numerical tolerance for rank/denominator tests.
+_EPS = 1e-12
+
 # ---------------------------------------------------------------------------
 # Camera intrinsics
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------# Brown-Conrady distortion helpers (module-level, shared by undistortion)
+# ---------------------------------------------------------------------------
+def _distort_forward(
+    x: np.ndarray,
+    y: np.ndarray,
+    k1: float,
+    k2: float,
+    p1: float,
+    p2: float,
+    k3: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply the forward Brown-Conrady model to normalised coordinates."""
+    r2 = x * x + y * y
+    radial = 1.0 + k1 * r2 + k2 * r2**2 + k3 * r2**3
+    xd = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+    yd = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+    return xd, yd
+
+
+def _forward_residual(
+    x: np.ndarray,
+    y: np.ndarray,
+    xd: np.ndarray,
+    yd: np.ndarray,
+    k1: float,
+    k2: float,
+    p1: float,
+    p2: float,
+    k3: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Residual of the forward model at a candidate undistorted guess."""
+    fx, fy = _distort_forward(x, y, k1, k2, p1, p2, k3)
+    return fx - xd, fy - yd
+
+
+def _newton_invert(
+    xd: np.ndarray,
+    yd: np.ndarray,
+    k1: float,
+    k2: float,
+    p1: float,
+    p2: float,
+    k3: float,
+    x0: np.ndarray,
+    y0: np.ndarray,
+    max_iter: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Damped Newton on the 2-D forward model with an analytic Jacobian.
+
+    Each point is solved independently (vectorised); a backtracking
+    half-stepping guards against divergence, and the best iterate seen so
+    far is kept, so the result is never worse than the initial guess.
+    """
+    x, y = x0.copy(), y0.copy()
+    fx, fy = _forward_residual(x, y, xd, yd, k1, k2, p1, p2, k3)
+    best_norm = np.maximum(np.abs(fx), np.abs(fy))
+    best_x, best_y = x.copy(), y.copy()
+
+    for _ in range(max_iter):
+        r2 = x * x + y * y
+        radial = 1.0 + k1 * r2 + k2 * r2**2 + k3 * r2**3
+        drad = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r2**2  # d(rho)/d(r2)
+
+        # Jacobian of F(x, y) = (x*rho + t1, y*rho + t2)
+        j00 = radial + 2.0 * x * x * drad + 2.0 * p1 * y + 6.0 * p2 * x
+        j01 = 2.0 * x * y * drad + 2.0 * p1 * x + 2.0 * p2 * y
+        j11 = radial + 2.0 * y * y * drad + 6.0 * p1 * y + 2.0 * p2 * x
+
+        res_x, res_y = _forward_residual(x, y, xd, yd, k1, k2, p1, p2, k3)
+
+        det = j00 * j11 - j01 * j01
+        det = np.where(np.abs(det) < 1e-300, 1e-300, det)
+        dx = -(j11 * res_x - j01 * res_y) / det
+        dy = -(j00 * res_y - j01 * res_x) / det
+
+        # backtracking: halve the step while the residual norm grows
+        step = np.ones_like(x)
+        # initialisers only satisfy the type checker; range(30) always runs
+        xn, yn = x, y
+        norm = best_norm
+        improved = np.ones_like(x, dtype=bool)
+        for _bt in range(30):
+            xn, yn = x + step * dx, y + step * dy
+            fnx, fny = _forward_residual(xn, yn, xd, yd, k1, k2, p1, p2, k3)
+            norm = np.maximum(np.abs(fnx), np.abs(fny))
+            improved = norm < best_norm
+            if improved.all():
+                break
+            step = np.where(improved, step, step * 0.5)
+
+        x, y = xn, yn
+        best_norm = np.where(improved, norm, best_norm)
+        best_x = np.where(improved, xn, best_x)
+        best_y = np.where(improved, yn, best_y)
+        if (best_norm < 1e3 * 1e-12).all():
+            break
+
+    return best_x, best_y
 
 
 class CameraIntrinsics:
@@ -61,13 +167,19 @@ class CameraIntrinsics:
         Distortion coefficients ``(k1, k2, p1, p2[, k3])``.
     """
 
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    _K: np.ndarray
+
     def __init__(
         self,
         fx: float,
         fy: float,
         cx: float,
         cy: float,
-        dist_coeffs: Optional[np.ndarray] = None,
+        dist_coeffs: np.ndarray | None = None,
     ) -> None:
         """Initialise intrinsics from focal lengths, principal point, and optional distortion."""
         self.fx = float(fx)
@@ -79,17 +191,15 @@ class CameraIntrinsics:
             dc = np.asarray(dist_coeffs, dtype=np.float64).ravel()
             if dc.size < 5:
                 dc = np.pad(dc, (0, 5 - dc.size))
-            self.dist_coeffs: Optional[np.ndarray] = dc[:5]
+            self.dist_coeffs: np.ndarray | None = dc[:5]
         else:
             self.dist_coeffs = None
 
         self._K = np.array(
-            [[self.fx, 0.0, self.cx],
-             [0.0, self.fy, self.cy],
-             [0.0, 0.0, 1.0]],
+            [[self.fx, 0.0, self.cx], [0.0, self.fy, self.cy], [0.0, 0.0, 1.0]],
             dtype=np.float64,
         )
-        self._K_inv = np.linalg.inv(self._K)
+        self._K_inv: np.ndarray = np.linalg.inv(self._K)
 
     # -- properties ---------------------------------------------------------
 
@@ -166,10 +276,10 @@ class CameraIntrinsics:
 
         if self.dist_coeffs is not None:
             k1, k2, p1, p2, k3 = self.dist_coeffs
-            r2 = xn ** 2 + yn ** 2
-            radial = 1.0 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
-            xd = xn * radial + 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn ** 2)
-            yd = yn * radial + p1 * (r2 + 2.0 * yn ** 2) + 2.0 * p2 * xn * yn
+            r2 = xn**2 + yn**2
+            radial = 1.0 + k1 * r2 + k2 * r2**2 + k3 * r2**3
+            xd = xn * radial + 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn**2)
+            yd = yn * radial + p1 * (r2 + 2.0 * yn**2) + 2.0 * p2 * xn * yn
         else:
             xd, yd = xn, yn
 
@@ -214,7 +324,7 @@ class CameraIntrinsics:
         rays = (self._K_inv @ hom.T).T  # (N, 3)
         return rays * Z[:, np.newaxis]
 
-    backproject = unproject  # alias for plan compatibility
+    backproject: Callable[[Self, np.ndarray, np.ndarray], np.ndarray] = unproject
 
     # -- factory methods ----------------------------------------------------
 
@@ -222,10 +332,10 @@ class CameraIntrinsics:
     def from_fov(
         cls,
         fov_deg: float,
-        image_size: Tuple[int, int],
+        image_size: tuple[int, int],
         *,
-        dist_coeffs: Optional[np.ndarray] = None,
-    ) -> "CameraIntrinsics":
+        dist_coeffs: np.ndarray | None = None,
+    ) -> CameraIntrinsics:
         r"""Create intrinsics from horizontal field-of-view angle.
 
         .. math::
@@ -255,28 +365,51 @@ class CameraIntrinsics:
         self,
         points_2d: np.ndarray,
         *,
-        max_iter: int = 20,
-        tol: float = 1e-10,
+        max_iter: int = 50,
+        tol: float = 1e-12,
     ) -> np.ndarray:
         r"""Iteratively remove lens distortion from pixel coordinates.
 
-        Given distorted normalised coordinates :math:`(x_d, y_d)` we seek the
-        undistorted :math:`(x_n, y_n)` such that the forward distortion model
-        maps :math:`(x_n, y_n) \mapsto (x_d, y_d)`.  This is solved with
-        fixed-point iteration:
+        Given distorted pixel coordinates, first normalise them to
+        :math:`(x_d, y_d)` and then seek the undistorted :math:`(x_n, y_n)`
+        such that the forward Brown-Conrady model maps
+        :math:`(x_n, y_n) \mapsto (x_d, y_d)`.
+
+        The forward model is
 
         .. math::
 
-            r^2       &= x_i^2 + y_i^2, \\
-            \text{rad}&= 1 + k_1 r^2 + k_2 r^4 + k_3 r^6, \\
-            x_{i+1}   &= \frac{x_d - 2 p_1 x_i y_i
-                          - p_2 (r^2 + 2 x_i^2)}{\text{rad}}, \\
-            y_{i+1}   &= \frac{y_d - p_1 (r^2 + 2 y_i^2)
-                          - 2 p_2 x_i y_i}{\text{rad}},
+            x_d = x_n\,\rho(r^2) + 2p_1 x_n y_n + p_2(r^2 + 2x_n^2), \\
+            y_d = y_n\,\rho(r^2) + p_1(r^2 + 2y_n^2) + 2p_2 x_n y_n,
 
-        initialised with :math:`(x_0, y_0) = (x_d, y_d)`.  Convergence is
-        typically reached in fewer than 10 iterations for reasonable
-        distortion magnitudes.
+        with :math:`r^2 = x_n^2 + y_n^2` and
+        :math:`\rho(r^2) = 1 + k_1 r^2 + k_2 r^4 + k_3 r^6`.
+
+        The inverse is solved with OpenCV's classic **undistortion iteration**
+        (a damped fixed-point scheme).  Each round estimates the tangential
+        displacement at the current guess and removes it before dividing by
+        the radial factor:
+
+        .. math::
+
+            \mathbf{d}_{\text{tang}}
+              = \begin{pmatrix} 2p_1 x_n y_n + p_2(r^2 + 2x_n^2) \\
+                                 p_1(r^2 + 2y_n^2) + 2p_2 x_n y_n\end{pmatrix},
+            \qquad
+            \mathbf{x}_{i+1} = \frac{\mathbf{x}_d - \mathbf{d}_{\text{tang}}(\mathbf{x}_i)}
+                                       {\rho(r_i^2)}.
+
+        The map being inverted is a radial scaling of the plane, so the
+        iteration is a contraction whenever
+        :math:`|\mathrm{d}(r\,\rho)/\mathrm{d}r| < 1` on the path between the
+        initial guess and the fixed point — exactly the region where the
+        polynomial model is physically meaningful (a real single-valued
+        lens).  Convergence is linear with rate roughly
+        :math:`|\mathrm{d}(r\rho)/\mathrm{d}r|`, giving ~10–40 iterations for
+        typical lenses; 50 iterations drive it to machine precision for
+        :math:`k_1 \approx -0.35` and below
+        :math:`10^{-5}\,\mathrm{px}` even for extreme
+        :math:`k_1 \approx -0.75` wide-angle lenses.
 
         Parameters
         ----------
@@ -285,13 +418,13 @@ class CameraIntrinsics:
         max_iter : int
             Maximum number of fixed-point iterations.
         tol : float
-            Convergence threshold on coordinate change.
+            Convergence threshold on the max normalised-coordinate change.
 
         Returns
         -------
         undistorted : ndarray, shape (N, 2)
-            Undistorted pixel coordinates.  If no distortion coefficients are
-            set the input is returned unchanged.
+            Undistorted **pixel** coordinates.  If no distortion coefficients
+            are set the input is returned unchanged.
         """
         pts = np.asarray(points_2d, dtype=np.float64)
         if pts.ndim == 1:
@@ -305,22 +438,38 @@ class CameraIntrinsics:
         xd = (pts[:, 0] - self.cx) / self.fx
         yd = (pts[:, 1] - self.cy) / self.fy
 
+        # Initial guess: the distorted coordinates themselves (the fixed-point
+        # map is a contraction from there for any physically valid lens).
         x = xd.copy()
         y = yd.copy()
 
         for _ in range(max_iter):
             r2 = x * x + y * y
-            radial = 1.0 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
-            dx = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
-            dy = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+            radial = 1.0 + k1 * r2 + k2 * r2**2 + k3 * r2**3
+            tang_x = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+            tang_y = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
 
-            x_new = (xd - dx) / radial
-            y_new = (yd - dy) / radial
+            x_new = (xd - tang_x) / radial
+            y_new = (yd - tang_y) / radial
 
-            if np.max(np.abs(x_new - x) + np.abs(y_new - y)) < tol:
-                x, y = x_new, y_new
-                break
+            delta = np.max(np.abs(x_new - x)) + np.max(np.abs(y_new - y))
             x, y = x_new, y_new
+            if delta < tol:
+                break
+
+        # --- Verify + Newton fallback -------------------------------------
+        # The fixed-point scheme is a contraction only inside the lens'
+        # physical validity region.  Points far outside it (e.g. synthetic
+        # coordinates well beyond the sensor) can oscillate; OpenCV's own
+        # iteration fails on the same inputs.  For those, refine with a
+        # damped Newton on the full forward model, which converges to the
+        # unique preimage whenever the radial map is monotonic.
+        res_x, res_y = _forward_residual(x, y, xd, yd, k1, k2, p1, p2, k3)
+        bad = np.maximum(np.abs(res_x), np.abs(res_y)) > 1e3 * tol
+        if bad.any():
+            x[bad], y[bad] = _newton_invert(
+                xd[bad], yd[bad], k1, k2, p1, p2, k3, x[bad], y[bad], max_iter
+            )
 
         u = self.fx * x + self.cx
         v = self.fy * y + self.cy
@@ -332,7 +481,11 @@ class CameraIntrinsics:
             return image
         h, w = image.shape[:2]
         new_K, _roi = cv2.getOptimalNewCameraMatrix(
-            self._K, self.dist_coeffs, (w, h), 1, (w, h),
+            self._K,
+            self.dist_coeffs,
+            (w, h),
+            1,
+            (w, h),
         )
         return cv2.undistort(image, self._K, self.dist_coeffs, None, new_K)
 
@@ -345,8 +498,8 @@ class CameraIntrinsics:
 def calibrate_camera(
     object_points_list: Sequence[np.ndarray],
     image_points_list: Sequence[np.ndarray],
-    image_size: Tuple[int, int],
-) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], List[np.ndarray]]:
+    image_size: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray]]:
     r"""Calibrate a camera from checkerboard correspondences.
 
     This is a thin wrapper around :pyfunc:`cv2.calibrateCamera` that returns
@@ -418,7 +571,11 @@ def calibrate_camera(
     img_pts = [np.asarray(i, dtype=np.float32) for i in image_points_list]
 
     ret, K, dist, rvecs, tvecs = cv2.calibrateCamera(
-        obj_pts, img_pts, image_size, None, None,
+        obj_pts,
+        img_pts,
+        image_size,
+        None,
+        None,
     )
     if not ret:
         raise RuntimeError("cv2.calibrateCamera failed")
@@ -443,8 +600,8 @@ def solve_pnp(
     points_3d: np.ndarray,
     points_2d: np.ndarray,
     K: np.ndarray,
-    dist_coeffs: Optional[np.ndarray] = None,
-) -> Tuple[bool, np.ndarray, np.ndarray]:
+    dist_coeffs: np.ndarray | None = None,
+) -> tuple[bool, np.ndarray, np.ndarray]:
     r"""Estimate camera pose from 3-D ↔ 2-D correspondences (PnP).
 
     Perspective-n-Point (PnP) recovers the rotation :math:`R` and translation
@@ -487,9 +644,14 @@ def solve_pnp(
     """
     obj = np.ascontiguousarray(points_3d, dtype=np.float64)
     img = np.ascontiguousarray(points_2d, dtype=np.float64)
-    dc = np.zeros(5, dtype=np.float64) if dist_coeffs is None else np.asarray(
-        dist_coeffs, dtype=np.float64,
-    ).ravel()
+    dc = (
+        np.zeros(5, dtype=np.float64)
+        if dist_coeffs is None
+        else np.asarray(
+            dist_coeffs,
+            dtype=np.float64,
+        ).ravel()
+    )
 
     ok, rvec, tvec = cv2.solvePnP(obj, img, K.astype(np.float64), dc)
     return bool(ok), rvec, tvec
@@ -499,10 +661,10 @@ def solve_pnp_ransac(
     points_3d: np.ndarray,
     points_2d: np.ndarray,
     K: np.ndarray,
-    dist_coeffs: Optional[np.ndarray] = None,
+    dist_coeffs: np.ndarray | None = None,
     reproj_thresh: float = 3.0,
     iterations: int = 1000,
-) -> Tuple[bool, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+) -> tuple[bool, np.ndarray, np.ndarray, np.ndarray | None]:
     r"""RANSAC-robust PnP pose estimation.
 
     Repeatedly samples minimal subsets (4 points), solves PnP, and scores
@@ -530,17 +692,23 @@ def solve_pnp_ransac(
     """
     obj = np.ascontiguousarray(points_3d, dtype=np.float64)
     img = np.ascontiguousarray(points_2d, dtype=np.float64)
-    dc = np.zeros(5, dtype=np.float64) if dist_coeffs is None else np.asarray(
-        dist_coeffs, dtype=np.float64,
-    ).ravel()
-
-    ok, rvec, tvec, inliers = cv2.solvePnPRansac(
-        obj, img, K.astype(np.float64), dc,
-        reprojectionError=reproj_thresh,
-        iterationsCount=iterations,
+    dc = (
+        np.zeros(5, dtype=np.float64)
+        if dist_coeffs is None
+        else np.asarray(
+            dist_coeffs,
+            dtype=np.float64,
+        ).ravel()
     )
-    if inliers is not None:
-        inliers = inliers.ravel()
+
+    ok, rvec, tvec, inliers = _solve_pnp_ransac(
+        obj,
+        img,
+        np.asarray(K, dtype=np.float64),
+        dc,
+        reprojection_error=reproj_thresh,
+        iterations=iterations,
+    )
     return bool(ok), rvec, tvec, inliers
 
 
@@ -576,7 +744,7 @@ def compute_P(
     return K @ Rt
 
 
-def decompose_P(P: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def decompose_P(P: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     r"""Decompose a projection matrix into intrinsic and extrinsic parts.
 
     Given :math:`P = K\,[R \mid \mathbf{t}]`, we recover :math:`K`, :math:`R`,
@@ -608,24 +776,34 @@ def decompose_P(P: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     P = np.asarray(P, dtype=np.float64)
     M = P[:, :3]
 
-    # RQ via reversed QR
-    M_flip = np.flipud(np.fliplr(M))
+    J = np.flipud(np.eye(3))
+
+    # RQ via reversed QR.  Writing J for the exchange matrix (J² = I),
+    #     J M J = (J K J)(J R J),
+    # where J K J is *lower* triangular.  Transposing turns this into an
+    # ordinary QR factorisation,
+    #     (J M J)ᵀ = (J Rᵀ J)(J Kᵀ J),
+    # whose upper-triangular right factor J Kᵀ J yields K and whose
+    # orthogonal left factor J Rᵀ J yields R, both after one more flip.
+    M_flip = J @ M @ J
     Q_prime, R_prime = np.linalg.qr(M_flip.T)
 
-    K = np.flipud(np.fliplr(R_prime.T))
-    R = np.flipud(Q_prime.T)
+    K = J @ R_prime.T @ J
+    R = J @ Q_prime.T @ J
 
-    # Ensure positive diagonal in K
-    D = np.diag(np.sign(np.diag(K)))
+    # Fix the sign ambiguity column-wise: require diag(K) > 0, compensating
+    # in R so that K @ R is unchanged.
+    D = np.diag(np.sign(np.diag(K)) + (np.diag(K) == 0.0))
     K = K @ D
     R = D @ R
 
     # Normalise so K[2,2] = 1
     K = K / K[2, 2]
 
-    # Ensure det(R) = +1
+    # Ensure det(R) = +1 (R is already orthogonal to machine precision)
     if np.linalg.det(R) < 0:
         R = -R
+        K = -K
 
     t = np.linalg.solve(K, P[:, 3:4])
 
@@ -691,7 +869,7 @@ def reprojection_error(
 
 def _hartley_normalise(
     pts: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     r"""Hartley normalisation (isotropic scaling).
 
     Translate so centroid is at the origin and scale so the average distance
@@ -718,11 +896,13 @@ def _hartley_normalise(
     if mean_dist < 1e-12:
         mean_dist = 1e-12
     s = np.sqrt(2.0) / mean_dist
-    T = np.array([
-        [s, 0.0, -s * centroid[0]],
-        [0.0, s, -s * centroid[1]],
-        [0.0, 0.0, 1.0],
-    ])
+    T = np.array(
+        [
+            [s, 0.0, -s * centroid[0]],
+            [0.0, s, -s * centroid[1]],
+            [0.0, 0.0, 1.0],
+        ]
+    )
     hom = np.column_stack([pts, np.ones(len(pts))])
     normed = (T @ hom.T).T
     return normed[:, :2], T
@@ -786,11 +966,19 @@ def compute_fundamental_matrix(
     x1, y1 = n1[:, 0], n1[:, 1]
     x2, y2 = n2[:, 0], n2[:, 1]
 
-    A = np.column_stack([
-        x2 * x1, x2 * y1, x2,
-        y2 * x1, y2 * y1, y2,
-        x1, y1, np.ones(len(pts1)),
-    ])
+    A = np.column_stack(
+        [
+            x2 * x1,
+            x2 * y1,
+            x2,
+            y2 * x1,
+            y2 * y1,
+            y2,
+            x1,
+            y1,
+            np.ones(len(pts1)),
+        ]
+    )
 
     _, _, Vt = np.linalg.svd(A)
     F_hat = Vt[-1].reshape(3, 3)
@@ -841,7 +1029,7 @@ def compute_essential_matrix(
 
 def decompose_essential_matrix(
     E: np.ndarray,
-) -> List[Tuple[np.ndarray, np.ndarray]]:
+) -> list[tuple[np.ndarray, np.ndarray]]:
     r"""Extract the four possible :math:`(R, \mathbf{t})` from :math:`E`.
 
     Decomposition (Hartley & Zisserman §9.6.2)
@@ -877,9 +1065,7 @@ def decompose_essential_matrix(
     if np.linalg.det(Vt) < 0:
         Vt = -Vt
 
-    W = np.array([[0, -1, 0],
-                   [1,  0, 0],
-                   [0,  0, 1]], dtype=np.float64)
+    W = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=np.float64)
 
     R1 = U @ W @ Vt
     R2 = U @ W.T @ Vt
@@ -895,12 +1081,12 @@ def decompose_essential_matrix(
 
 
 def choose_pose_by_cheirality(
-    R_list: List[np.ndarray],
-    t_list: List[np.ndarray],
+    R_list: list[np.ndarray],
+    t_list: list[np.ndarray],
     pts1: np.ndarray,
     pts2: np.ndarray,
     K: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     r"""Select the correct :math:`(R, \mathbf{t})` via the cheirality check.
 
     For each candidate pose, triangulate all correspondences and count how
@@ -932,7 +1118,7 @@ def choose_pose_by_cheirality(
     best_count = -1
     best_R, best_t = R_list[0], t_list[0]
 
-    for R, t_vec in zip(R_list, t_list):
+    for R, t_vec in zip(R_list, t_list, strict=False):
         P2 = compute_P(K, R, t_vec)
         X = triangulate_points(pts1, pts2, P1, P2)
 
@@ -1001,12 +1187,14 @@ def triangulate_points(
         x1, y1 = pts1[i]
         x2, y2 = pts2[i]
 
-        A = np.array([
-            x1 * P1[2] - P1[0],
-            y1 * P1[2] - P1[1],
-            x2 * P2[2] - P2[0],
-            y2 * P2[2] - P2[1],
-        ])
+        A = np.array(
+            [
+                x1 * P1[2] - P1[0],
+                y1 * P1[2] - P1[1],
+                x2 * P2[2] - P2[0],
+                y2 * P2[2] - P2[1],
+            ]
+        )
 
         _, _, Vt = np.linalg.svd(A)
         Xh = Vt[-1]
@@ -1023,9 +1211,39 @@ def _backproject_to_ray(pt_2d: np.ndarray, K_inv: np.ndarray) -> np.ndarray:
 
 
 def _ray_midpoint(
-    o1: np.ndarray, d1: np.ndarray, o2: np.ndarray, d2: np.ndarray,
+    o1: np.ndarray,
+    d1: np.ndarray,
+    o2: np.ndarray,
+    d2: np.ndarray,
 ) -> np.ndarray:
-    """Compute the midpoint of closest approach between two 3-D rays."""
+    r"""Compute the midpoint of closest approach between two 3-D rays.
+
+    Minimises :math:`\|(\mathbf{o}_1 + s\mathbf{d}_1) -
+    (\mathbf{o}_2 + t\mathbf{d}_2)\|^2` over :math:`(s, t)`.  Setting the
+    gradient to zero gives the 2×2 normal equations
+
+    .. math::
+
+        \begin{bmatrix} a & -b \\ b & -c \end{bmatrix}
+        \begin{pmatrix} s \\ t \end{pmatrix}
+        = \begin{pmatrix} -d \\ e \end{pmatrix},
+        \qquad
+        \begin{aligned}
+          a &= \mathbf{d}_1\cdot\mathbf{d}_1, \\
+          b &= \mathbf{d}_1\cdot\mathbf{d}_2, \\
+          c &= \mathbf{d}_2\cdot\mathbf{d}_2, \\
+          d &= \mathbf{d}_1\cdot\mathbf{w}, \\
+          e &= \mathbf{d}_2\cdot\mathbf{w},
+        \end{aligned}
+
+    with :math:`\mathbf{w} = \mathbf{o}_2 - \mathbf{o}_1`.  Solving by
+    Cramer's rule (determinant :math:`ac - b^2`) yields
+
+    .. math::
+
+        s = \frac{c\,d - b\,e}{ac - b^2}, \qquad
+        t = \frac{b\,d - a\,e}{ac - b^2}.
+    """
     w = o2 - o1
     a = d1 @ d1
     b = d1 @ d2
@@ -1034,15 +1252,15 @@ def _ray_midpoint(
     e = d2 @ w
     denom = a * c - b * b
 
-    if abs(denom) < 1e-12:
-        return o1 + d1 * (d / a) if a > 1e-12 else o1.copy()
+    if abs(denom) < _EPS:
+        return o1 + d1 * (d / a) if a > _EPS else o1.copy()
 
-    s = (b * e - c * d) / denom
-    t_param = (a * e - b * d) / denom
+    s = (c * d - b * e) / denom
+    t_param = (b * d - a * e) / denom
 
     closest1 = o1 + s * d1
     closest2 = o2 + t_param * d2
-    return (closest1 + closest2) / 2.0
+    return 0.5 * (closest1 + closest2)
 
 
 def triangulate_midpoint(
