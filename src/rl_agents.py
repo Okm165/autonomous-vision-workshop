@@ -10,23 +10,49 @@ References:
     - Fujimoto et al., "Addressing Function Approximation Error in
       Actor-Critic Methods" (TD3), ICML 2018
 """
+
 from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, TypedDict
 
 import numpy as np
 from numpy.typing import NDArray
-from typing import Tuple, Optional, List, Dict, Iterator
-from dataclasses import dataclass
+
+if TYPE_CHECKING:
+    from src.drone import QuadrotorParams, QuadrotorState
+    from src.path_planning import OccupancyGrid3D
+
+
+class ReplayBatch(TypedDict):
+    """Mini-batch of transitions sampled from :class:`ReplayBuffer`."""
+
+    obs: NDArray[np.float64]
+    actions: NDArray[np.float64]
+    rewards: NDArray[np.float64]
+    next_obs: NDArray[np.float64]
+    dones: NDArray[np.bool_]
 
 
 # ======================================================================
 #  Replay Buffer
 # ======================================================================
 
+
 class ReplayBuffer:
     """Experience replay buffer for off-policy RL.
 
     Stores transitions (s, a, r, s', done) in a circular buffer.
     """
+
+    capacity: int
+    ptr: int
+    size: int
+    obs: NDArray[np.float64]
+    actions: NDArray[np.float64]
+    rewards: NDArray[np.float64]
+    next_obs: NDArray[np.float64]
+    dones: NDArray[np.bool_]
 
     def __init__(self, capacity: int, obs_dim: int, act_dim: int):
         """Initialize the replay buffer with pre-allocated storage.
@@ -46,7 +72,14 @@ class ReplayBuffer:
         self.next_obs = np.zeros((capacity, obs_dim))
         self.dones = np.zeros(capacity, dtype=bool)
 
-    def add(self, obs, action, reward, next_obs, done) -> None:
+    def add(
+        self,
+        obs: NDArray[np.floating],
+        action: NDArray[np.floating],
+        reward: float,
+        next_obs: NDArray[np.floating],
+        done: bool,
+    ) -> None:
         """Store a single transition ``(s, a, r, s', done)``."""
         self.obs[self.ptr] = obs
         self.actions[self.ptr] = action
@@ -56,7 +89,11 @@ class ReplayBuffer:
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int, rng=None) -> Dict[str, NDArray]:
+    def sample(
+        self,
+        batch_size: int,
+        rng: np.random.RandomState | None = None,
+    ) -> ReplayBatch:
         """Sample a random mini-batch of transitions.
 
         Parameters
@@ -82,18 +119,26 @@ class RolloutBuffer:
     Stores full trajectories with log probabilities and value estimates.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize empty trajectory lists for on-policy collection."""
-        self.obs = []
-        self.actions = []
-        self.rewards = []
-        self.dones = []
-        self.log_probs = []
-        self.values = []
-        self.returns = []
-        self.advantages = []
+        self.obs: list[NDArray[np.floating]] = []
+        self.actions: list[NDArray[np.floating]] = []
+        self.rewards: list[float] = []
+        self.dones: list[bool] = []
+        self.log_probs: list[float] = []
+        self.values: list[float] = []
+        self.returns: list[float] = []
+        self.advantages: list[float] = []
 
-    def add(self, obs, action, reward, done, log_prob, value) -> None:
+    def add(
+        self,
+        obs: NDArray[np.floating],
+        action: NDArray[np.floating],
+        reward: float,
+        done: bool,
+        log_prob: float,
+        value: float,
+    ) -> None:
         """Append a single timestep to the rollout buffer."""
         self.obs.append(obs)
         self.actions.append(action)
@@ -142,7 +187,11 @@ class RolloutBuffer:
             self.returns[t] = gae + self.values[t]
             next_value = self.values[t]
 
-    def get_batches(self, batch_size: int, rng=None) -> Iterator[Dict[str, NDArray]]:
+    def get_batches(
+        self,
+        batch_size: int,
+        rng: np.random.RandomState | None = None,
+    ) -> Iterator[dict[str, NDArray[np.float64]]]:
         """Yield mini-batches for PPO updates."""
         if rng is None:
             rng = np.random.RandomState()
@@ -169,7 +218,8 @@ class RolloutBuffer:
 #  Simple Neural Network (NumPy MLP)
 # ======================================================================
 
-def _relu(x: NDArray) -> NDArray:
+
+def _relu(x: NDArray[np.floating]) -> NDArray[np.float64]:
     """Apply element-wise ReLU activation, max(0, x).
 
     Args:
@@ -181,7 +231,7 @@ def _relu(x: NDArray) -> NDArray:
     return np.maximum(0, x)
 
 
-def _tanh(x: NDArray) -> NDArray:
+def _tanh(x: NDArray[np.floating]) -> NDArray[np.float64]:
     """Apply element-wise hyperbolic tangent activation.
 
     Args:
@@ -211,14 +261,23 @@ class MLPPolicy:
         \right]
     """
 
+    obs_dim: int
+    act_dim: int
+    rng: np.random.RandomState
+    weights: list[NDArray[np.float64]]
+    biases: list[NDArray[np.float64]]
+    w_mean: NDArray[np.float64]
+    b_mean: NDArray[np.float64]
+    log_std: NDArray[np.float64]
+
     def __init__(
         self,
         obs_dim: int,
         act_dim: int,
-        hidden_sizes: Tuple[int, ...] = (64, 64),
+        hidden_sizes: tuple[int, ...] = (64, 64),
         log_std_init: float = -0.5,
         seed: int = 42,
-    ):
+    ) -> None:
         """Initialize MLP policy with Xavier-initialized hidden layers.
 
         Args:
@@ -233,13 +292,13 @@ class MLPPolicy:
         self.rng = np.random.RandomState(seed)
 
         # Xavier initialization
-        sizes = [obs_dim] + list(hidden_sizes)
+        sizes = [obs_dim, *list(hidden_sizes)]
         self.weights = []
         self.biases = []
         for i in range(len(sizes) - 1):
-            scale = np.sqrt(2.0 / (sizes[i] + sizes[i+1]))
-            self.weights.append(self.rng.randn(sizes[i], sizes[i+1]) * scale)
-            self.biases.append(np.zeros(sizes[i+1]))
+            scale = np.sqrt(2.0 / (sizes[i] + sizes[i + 1]))
+            self.weights.append(self.rng.randn(sizes[i], sizes[i + 1]) * scale)
+            self.biases.append(np.zeros(sizes[i + 1]))
 
         # Output heads: mean and log_std
         scale = np.sqrt(2.0 / (sizes[-1] + act_dim))
@@ -247,15 +306,19 @@ class MLPPolicy:
         self.b_mean = np.zeros(act_dim)
         self.log_std = np.full(act_dim, log_std_init)
 
-    def forward(self, obs: NDArray) -> Tuple[NDArray, NDArray]:
+    def forward(
+        self, obs: NDArray[np.floating]
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Forward pass: obs -> (mean, log_std)."""
         x = obs
-        for w, b in zip(self.weights, self.biases):
+        for w, b in zip(self.weights, self.biases, strict=False):
             x = _tanh(x @ w + b)
         mean = x @ self.w_mean + self.b_mean
         return mean, self.log_std
 
-    def sample_action(self, obs: NDArray) -> Tuple[NDArray, float]:
+    def sample_action(
+        self, obs: NDArray[np.floating]
+    ) -> tuple[NDArray[np.float64], float]:
         """Sample action and compute log probability."""
         mean, log_std = self.forward(obs)
         std = np.exp(log_std)
@@ -264,7 +327,12 @@ class MLPPolicy:
         log_prob = self._log_prob(action, mean, log_std)
         return action, float(log_prob)
 
-    def _log_prob(self, action, mean, log_std):
+    def _log_prob(
+        self,
+        action: NDArray[np.floating],
+        mean: NDArray[np.floating],
+        log_std: NDArray[np.floating],
+    ) -> float:
         """Compute Gaussian log-probability of *action* given mean and log_std.
 
         Args:
@@ -276,21 +344,21 @@ class MLPPolicy:
             Scalar log-probability summed over action dimensions.
         """
         std = np.exp(log_std)
-        var = std ** 2
+        var = std**2
         log_prob = -0.5 * np.sum(
-            (action - mean)**2 / var + 2 * log_std + np.log(2 * np.pi)
+            (action - mean) ** 2 / var + 2 * log_std + np.log(2 * np.pi)
         )
-        return log_prob
+        return float(log_prob)
 
-    def get_params(self) -> List[NDArray]:
+    def get_params(self) -> list[NDArray[np.float64]]:
         """Return a flat list of all trainable parameter arrays."""
         params = []
-        for w, b in zip(self.weights, self.biases):
+        for w, b in zip(self.weights, self.biases, strict=False):
             params.extend([w, b])
         params.extend([self.w_mean, self.b_mean, self.log_std])
         return params
 
-    def set_params(self, params: List[NDArray]) -> None:
+    def set_params(self, params: list[NDArray[np.float64]]) -> None:
         """Overwrite all trainable parameters from a flat list."""
         idx = 0
         for i in range(len(self.weights)):
@@ -305,12 +373,18 @@ class MLPPolicy:
 class MLPValueFunction:
     """MLP value function V(s) or Q(s, a)."""
 
+    rng: np.random.RandomState
+    weights: list[NDArray[np.float64]]
+    biases: list[NDArray[np.float64]]
+    w_out: NDArray[np.float64]
+    b_out: NDArray[np.float64]
+
     def __init__(
         self,
         input_dim: int,
-        hidden_sizes: Tuple[int, ...] = (64, 64),
+        hidden_sizes: tuple[int, ...] = (64, 64),
         seed: int = 42,
-    ):
+    ) -> None:
         """Initialize the MLP value network with Xavier-initialized layers.
 
         Args:
@@ -319,21 +393,21 @@ class MLPValueFunction:
             seed: Random seed for weight initialization.
         """
         self.rng = np.random.RandomState(seed)
-        sizes = [input_dim] + list(hidden_sizes)
+        sizes = [input_dim, *list(hidden_sizes)]
         self.weights = []
         self.biases = []
         for i in range(len(sizes) - 1):
-            scale = np.sqrt(2.0 / (sizes[i] + sizes[i+1]))
-            self.weights.append(self.rng.randn(sizes[i], sizes[i+1]) * scale)
-            self.biases.append(np.zeros(sizes[i+1]))
+            scale = np.sqrt(2.0 / (sizes[i] + sizes[i + 1]))
+            self.weights.append(self.rng.randn(sizes[i], sizes[i + 1]) * scale)
+            self.biases.append(np.zeros(sizes[i + 1]))
 
         scale = np.sqrt(2.0 / sizes[-1])
         self.w_out = self.rng.randn(sizes[-1], 1) * scale * 0.01
         self.b_out = np.zeros(1)
 
-    def forward(self, x: NDArray) -> NDArray:
+    def forward(self, x: NDArray[np.floating]) -> NDArray[np.float64]:
         """Compute the scalar value estimate for input *x*."""
-        for w, b in zip(self.weights, self.biases):
+        for w, b in zip(self.weights, self.biases, strict=False):
             x = _relu(x @ w + b)
         out = (x @ self.w_out + self.b_out).squeeze(-1)
         return np.clip(out, -1000, 1000)
@@ -342,6 +416,7 @@ class MLPValueFunction:
 # ======================================================================
 #  PPO (Proximal Policy Optimization)
 # ======================================================================
+
 
 class PPO:
     r"""Proximal Policy Optimization (Schulman et al., 2017).
@@ -373,6 +448,20 @@ class PPO:
         H[\pi] = -\hat{\mathbb{E}} [\log \pi_\theta(a|s)]
     """
 
+    policy: MLPPolicy
+    value_fn: MLPValueFunction
+    buffer: RolloutBuffer
+    lr_policy: float
+    lr_value: float
+    gamma: float
+    lam: float
+    clip_eps: float
+    entropy_coef: float
+    n_epochs: int
+    batch_size: int
+    max_grad_norm: float
+    rng: np.random.RandomState
+
     def __init__(
         self,
         obs_dim: int,
@@ -387,7 +476,7 @@ class PPO:
         batch_size: int = 64,
         max_grad_norm: float = 10.0,
         seed: int = 42,
-    ):
+    ) -> None:
         """Initialize PPO agent with policy, value function, and rollout buffer.
 
         Args:
@@ -419,19 +508,29 @@ class PPO:
         self.max_grad_norm = max_grad_norm
         self.rng = np.random.RandomState(seed)
 
-        self.training_stats: List[Dict] = []
+        self.training_stats: list[dict[str, float]] = []
 
-    def select_action(self, obs: NDArray) -> Tuple[NDArray, float, float]:
+    def select_action(
+        self, obs: NDArray[np.floating]
+    ) -> tuple[NDArray[np.float64], float, float]:
         """Select action, return (action, log_prob, value)."""
         action, log_prob = self.policy.sample_action(obs)
         value = self.value_fn.forward(obs.reshape(1, -1))
         return action, log_prob, float(np.squeeze(value))
 
-    def store_transition(self, obs, action, reward, done, log_prob, value) -> None:
+    def store_transition(
+        self,
+        obs: NDArray[np.floating],
+        action: NDArray[np.floating],
+        reward: float,
+        done: bool,
+        log_prob: float,
+        value: float,
+    ) -> None:
         """Store a transition in the on-policy rollout buffer."""
         self.buffer.add(obs, action, reward, done, log_prob, value)
 
-    def update(self, last_obs: NDArray) -> Dict[str, float]:
+    def update(self, last_obs: NDArray[np.floating]) -> dict[str, float]:
         r"""Run PPO update with clipped objective.
 
         Finite-difference gradient approximation for the policy and
@@ -445,13 +544,12 @@ class PPO:
         advantages = np.array(self.buffer.advantages)
         adv_mean = np.mean(advantages)
         adv_std = np.std(advantages) + 1e-8
-        normalized_adv = (advantages - adv_mean) / adv_std
 
         # For this pure-NumPy implementation, we use evolution strategy
         # (parameter-space perturbation) as a gradient estimator
         stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
 
-        for epoch in range(self.n_epochs):
+        for _epoch in range(self.n_epochs):
             for batch in self.buffer.get_batches(self.batch_size, self.rng):
                 obs_batch = batch["obs"]
                 act_batch = batch["actions"]
@@ -462,14 +560,18 @@ class PPO:
                 means, log_stds = self.policy.forward(obs_batch)
                 stds = np.exp(log_stds)
                 new_log_probs = -0.5 * np.sum(
-                    (act_batch - means)**2 / stds**2 + 2 * log_stds + np.log(2 * np.pi),
-                    axis=-1
+                    (act_batch - means) ** 2 / stds**2
+                    + 2 * log_stds
+                    + np.log(2 * np.pi),
+                    axis=-1,
                 )
 
                 # Policy loss (PPO clip)
                 ratios = np.exp(new_log_probs - old_log_probs)
                 surr1 = ratios * adv_batch
-                surr2 = np.clip(ratios, 1 - self.clip_eps, 1 + self.clip_eps) * adv_batch
+                surr2 = (
+                    np.clip(ratios, 1 - self.clip_eps, 1 + self.clip_eps) * adv_batch
+                )
                 policy_loss = -np.mean(np.minimum(surr1, surr2))
 
                 # Entropy
@@ -477,11 +579,12 @@ class PPO:
 
                 # Value loss
                 values = self.value_fn.forward(obs_batch)
-                value_loss = 0.5 * np.mean((values - returns)**2)
+                value_loss = 0.5 * np.mean((values - returns) ** 2)
 
                 # Numerical gradient update (simplified ES-style)
-                self._numerical_update_policy(obs_batch, act_batch, adv_batch,
-                                              old_log_probs)
+                self._numerical_update_policy(
+                    obs_batch, act_batch, adv_batch, old_log_probs
+                )
                 self._numerical_update_value(obs_batch, returns)
 
                 stats["policy_loss"] = float(policy_loss)
@@ -541,8 +644,7 @@ class PPO:
         means, log_stds = self.policy.forward(obs)
         stds = np.exp(log_stds)
         new_log_probs = -0.5 * np.sum(
-            (actions - means)**2 / stds**2 + 2 * log_stds + np.log(2 * np.pi),
-            axis=-1
+            (actions - means) ** 2 / stds**2 + 2 * log_stds + np.log(2 * np.pi), axis=-1
         )
         log_ratios = np.clip(new_log_probs - old_log_probs, -20, 20)
         ratios = np.exp(log_ratios)
@@ -556,7 +658,7 @@ class PPO:
         """Gradient descent on value function MSE."""
         eps = 1e-3
         params_list = []
-        for w, b in zip(self.value_fn.weights, self.value_fn.biases):
+        for w, b in zip(self.value_fn.weights, self.value_fn.biases, strict=False):
             params_list.extend([w, b])
         params_list.extend([self.value_fn.w_out, self.value_fn.b_out])
 
@@ -571,12 +673,12 @@ class PPO:
                 flat[idx] = original + eps
                 params_list[param_idx] = flat.reshape(param.shape)
                 self._set_value_params(params_list)
-                loss_plus = np.mean((self.value_fn.forward(obs) - returns)**2)
+                loss_plus = np.mean((self.value_fn.forward(obs) - returns) ** 2)
 
                 flat[idx] = original - eps
                 params_list[param_idx] = flat.reshape(param.shape)
                 self._set_value_params(params_list)
-                loss_minus = np.mean((self.value_fn.forward(obs) - returns)**2)
+                loss_minus = np.mean((self.value_fn.forward(obs) - returns) ** 2)
 
                 grad_val = (loss_plus - loss_minus) / (2 * eps)
                 grad_val = np.clip(grad_val, -self.max_grad_norm, self.max_grad_norm)
@@ -606,6 +708,7 @@ class PPO:
 # ======================================================================
 #  SAC (Soft Actor-Critic)
 # ======================================================================
+
 
 class SAC:
     r"""Soft Actor-Critic (Haarnoja et al., 2018).
@@ -653,6 +756,21 @@ class SAC:
         - \sum_i \log(1 - \tanh^2(u_i))
     """
 
+    obs_dim: int
+    act_dim: int
+    gamma: float
+    tau: float
+    alpha: float
+    lr: float
+    batch_size: int
+    policy: MLPPolicy
+    q1: MLPValueFunction
+    q2: MLPValueFunction
+    q1_target: MLPValueFunction
+    q2_target: MLPValueFunction
+    buffer: ReplayBuffer
+    rng: np.random.RandomState
+
     def __init__(
         self,
         obs_dim: int,
@@ -664,7 +782,7 @@ class SAC:
         buffer_size: int = 100000,
         batch_size: int = 256,
         seed: int = 42,
-    ):
+    ) -> None:
         """Initialize SAC agent with twin Q-networks, targets, and replay buffer.
 
         Args:
@@ -694,9 +812,11 @@ class SAC:
 
         self.buffer = ReplayBuffer(buffer_size, obs_dim, act_dim)
         self.rng = np.random.RandomState(seed)
-        self.training_stats: List[Dict] = []
+        self.training_stats: list[dict[str, float]] = []
 
-    def select_action(self, obs: NDArray, deterministic: bool = False) -> NDArray:
+    def select_action(
+        self, obs: NDArray[np.floating], deterministic: bool = False
+    ) -> NDArray[np.float64]:
         """Sample action using squashed Gaussian policy."""
         mean, log_std = self.policy.forward(obs)
         if deterministic:
@@ -706,11 +826,18 @@ class SAC:
         u = mean + std * noise
         return np.tanh(u)
 
-    def store_transition(self, obs, action, reward, next_obs, done) -> None:
+    def store_transition(
+        self,
+        obs: NDArray[np.floating],
+        action: NDArray[np.floating],
+        reward: float,
+        next_obs: NDArray[np.floating],
+        done: bool,
+    ) -> None:
         """Store a transition in the off-policy replay buffer."""
         self.buffer.add(obs, action, reward, next_obs, done)
 
-    def update(self) -> Dict[str, float]:
+    def update(self) -> dict[str, float]:
         """Run one SAC update step."""
         if self.buffer.size < self.batch_size:
             return {}
@@ -730,22 +857,30 @@ class SAC:
 
         # Log prob with squashing correction
         next_log_probs = -0.5 * np.sum(
-            (next_u - next_means)**2 / next_stds**2 + 2 * next_log_stds + np.log(2 * np.pi),
-            axis=-1
+            (next_u - next_means) ** 2 / next_stds**2
+            + 2 * next_log_stds
+            + np.log(2 * np.pi),
+            axis=-1,
         )
         next_log_probs -= np.sum(np.log(1 - next_actions**2 + 1e-6), axis=-1)
 
-        q1_target = self.q1_target.forward(np.concatenate([next_obs, next_actions], axis=-1))
-        q2_target = self.q2_target.forward(np.concatenate([next_obs, next_actions], axis=-1))
+        q1_target = self.q1_target.forward(
+            np.concatenate([next_obs, next_actions], axis=-1)
+        )
+        q2_target = self.q2_target.forward(
+            np.concatenate([next_obs, next_actions], axis=-1)
+        )
         min_q_target = np.minimum(q1_target, q2_target)
-        target_q = rewards + self.gamma * (1 - dones) * (min_q_target - self.alpha * next_log_probs)
+        target_q = rewards + self.gamma * (1 - dones) * (
+            min_q_target - self.alpha * next_log_probs
+        )
 
         # Current Q values
         sa = np.concatenate([obs, actions], axis=-1)
         q1_val = self.q1.forward(sa)
         q2_val = self.q2.forward(sa)
 
-        q_loss = np.mean((q1_val - target_q)**2) + np.mean((q2_val - target_q)**2)
+        q_loss = np.mean((q1_val - target_q) ** 2) + np.mean((q2_val - target_q) ** 2)
 
         # Soft update targets
         self._soft_update()
@@ -758,24 +893,33 @@ class SAC:
 
     def _soft_update(self):
         """Polyak averaging for target networks."""
-        for w, wt in zip(self.q1.weights, self.q1_target.weights):
+        for w, wt in zip(self.q1.weights, self.q1_target.weights, strict=False):
             wt[:] = self.tau * w + (1 - self.tau) * wt
-        for b, bt in zip(self.q1.biases, self.q1_target.biases):
+        for b, bt in zip(self.q1.biases, self.q1_target.biases, strict=False):
             bt[:] = self.tau * b + (1 - self.tau) * bt
-        self.q1_target.w_out[:] = self.tau * self.q1.w_out + (1 - self.tau) * self.q1_target.w_out
-        self.q1_target.b_out[:] = self.tau * self.q1.b_out + (1 - self.tau) * self.q1_target.b_out
+        self.q1_target.w_out[:] = (
+            self.tau * self.q1.w_out + (1 - self.tau) * self.q1_target.w_out
+        )
+        self.q1_target.b_out[:] = (
+            self.tau * self.q1.b_out + (1 - self.tau) * self.q1_target.b_out
+        )
 
-        for w, wt in zip(self.q2.weights, self.q2_target.weights):
+        for w, wt in zip(self.q2.weights, self.q2_target.weights, strict=False):
             wt[:] = self.tau * w + (1 - self.tau) * wt
-        for b, bt in zip(self.q2.biases, self.q2_target.biases):
+        for b, bt in zip(self.q2.biases, self.q2_target.biases, strict=False):
             bt[:] = self.tau * b + (1 - self.tau) * bt
-        self.q2_target.w_out[:] = self.tau * self.q2.w_out + (1 - self.tau) * self.q2_target.w_out
-        self.q2_target.b_out[:] = self.tau * self.q2.b_out + (1 - self.tau) * self.q2_target.b_out
+        self.q2_target.w_out[:] = (
+            self.tau * self.q2.w_out + (1 - self.tau) * self.q2_target.w_out
+        )
+        self.q2_target.b_out[:] = (
+            self.tau * self.q2.b_out + (1 - self.tau) * self.q2_target.b_out
+        )
 
 
 # ======================================================================
 #  Drone Gym Environment
 # ======================================================================
+
 
 class DroneHoverEnv:
     r"""Gym-like environment for quadrotor hover stabilization.
@@ -795,13 +939,23 @@ class DroneHoverEnv:
     or flipped beyond recovery.
     """
 
+    target_pos: NDArray[np.float64]
+    max_steps: int
+    dt: float
+    params: QuadrotorParams
+    rng: np.random.RandomState
+    obs_dim: int
+    act_dim: int
+    state: QuadrotorState
+    step_count: int
+
     def __init__(
         self,
         target_pos: NDArray[np.float64] = np.array([0, 0, 1.0]),
         max_steps: int = 500,
         dt: float = 0.02,
         seed: int = 42,
-    ):
+    ) -> None:
         """Initialize the hover environment.
 
         Args:
@@ -810,7 +964,7 @@ class DroneHoverEnv:
             dt: Simulation timestep in seconds.
             seed: Random seed for initial-state perturbation.
         """
-        from src.drone import QuadrotorParams, QuadrotorState, simulate_step
+        from src.drone import QuadrotorParams, QuadrotorState
 
         self.target_pos = target_pos
         self.max_steps = max_steps
@@ -820,19 +974,25 @@ class DroneHoverEnv:
 
         self.obs_dim = 12
         self.act_dim = 4
-        self.state = None
         self.step_count = 0
+        # The environment always carries a state; ``reset`` re-samples the
+        # initial pose, so establish one immediately rather than leaving the
+        # attribute unset until the first reset.
+        self.state = QuadrotorState()
 
-    def reset(self) -> NDArray:
+    def reset(self) -> NDArray[np.float64]:
         """Reset the environment and return the initial observation."""
         from src.drone import QuadrotorState
+
         self.state = QuadrotorState()
         self.state.position = self.target_pos + self.rng.randn(3) * 0.3
         self.state.velocity = self.rng.randn(3) * 0.1
         self.step_count = 0
         return self._get_obs()
 
-    def step(self, action: NDArray) -> Tuple[NDArray, float, bool, Dict]:
+    def step(
+        self, action: NDArray[np.floating]
+    ) -> tuple[NDArray[np.float64], float, bool, dict[str, object]]:
         """Advance one timestep and return ``(obs, reward, done, info)``."""
         from src.drone import simulate_step
 
@@ -849,7 +1009,7 @@ class DroneHoverEnv:
 
         return obs, reward, done, {}
 
-    def _get_obs(self) -> NDArray:
+    def _get_obs(self) -> NDArray[np.float64]:
         """Build the 12-D observation vector from current drone state.
 
         Returns:
@@ -857,14 +1017,16 @@ class DroneHoverEnv:
         """
         pos_err = self.state.position - self.target_pos
         euler = self.state.euler_angles
-        return np.concatenate([
-            pos_err,
-            self.state.velocity,
-            euler,
-            self.state.omega,
-        ])
+        return np.concatenate(
+            [
+                pos_err,
+                self.state.velocity,
+                euler,
+                self.state.omega,
+            ]
+        )
 
-    def _compute_reward(self, action: NDArray) -> float:
+    def _compute_reward(self, action: NDArray[np.floating]) -> float:
         """Compute the shaped hover reward for the current state.
 
         Args:
@@ -904,9 +1066,7 @@ class DroneHoverEnv:
         if self.step_count >= self.max_steps:
             return True
         tilt = np.arccos(np.clip(self.state.rotation[2, 2], -1, 1))
-        if tilt > np.radians(75):
-            return True
-        return False
+        return bool(tilt > np.radians(75))
 
 
 class DroneNavigationEnv:
@@ -920,16 +1080,29 @@ class DroneNavigationEnv:
     **Reward**: progress toward goal + collision penalty + time penalty
     """
 
+    params: QuadrotorParams
+    dt: float
+    max_steps: int
+    n_depth_rays: int
+    rng: np.random.RandomState
+    grid: OccupancyGrid3D
+    obs_dim: int
+    act_dim: int
+    step_count: int
+    state: QuadrotorState
+    goal: NDArray[np.float64]
+    prev_dist: float
+
     def __init__(
         self,
-        grid_shape: Tuple[int, int, int] = (50, 50, 20),
+        grid_shape: tuple[int, int, int] = (50, 50, 20),
         resolution: float = 0.2,
         n_obstacles: int = 15,
         n_depth_rays: int = 8,
         max_steps: int = 1000,
         dt: float = 0.02,
         seed: int = 42,
-    ):
+    ) -> None:
         """Initialize the navigation environment with an obstacle grid.
 
         Args:
@@ -951,18 +1124,20 @@ class DroneNavigationEnv:
         self.rng = np.random.RandomState(seed)
 
         self.grid = create_random_obstacles(
-            grid_shape, n_obstacles, (3, 8), resolution,
-            origin=np.zeros(3), seed=seed
+            grid_shape, n_obstacles, (3, 8), resolution, origin=np.zeros(3), seed=seed
         )
 
         self.obs_dim = 12 + n_depth_rays
         self.act_dim = 4
-        self.state = None
-        self.goal = None
+        # The environment always carries a state, goal and previous distance;
+        # ``reset`` re-samples them at the start of each episode.  Establishing
+        # them here keeps the attributes non-optional for every consumer.
+        self.state = QuadrotorState()
+        self.goal = np.zeros(3, dtype=np.float64)
         self.step_count = 0
-        self.prev_dist = None
+        self.prev_dist = 0.0
 
-    def reset(self) -> NDArray:
+    def reset(self) -> NDArray[np.float64]:
         """Reset environment with random start/goal and return initial observation."""
         from src.drone import QuadrotorState
 
@@ -974,10 +1149,12 @@ class DroneNavigationEnv:
             self.goal = self._sample_free_point()
 
         self.step_count = 0
-        self.prev_dist = np.linalg.norm(self.state.position - self.goal)
+        self.prev_dist = float(np.linalg.norm(self.state.position - self.goal))
         return self._get_obs()
 
-    def step(self, action: NDArray) -> Tuple[NDArray, float, bool, Dict]:
+    def step(
+        self, action: NDArray[np.floating]
+    ) -> tuple[NDArray[np.float64], float, bool, dict[str, object]]:
         """Advance one timestep and return ``(obs, reward, done, info)``."""
         from src.drone import simulate_step
 
@@ -989,9 +1166,14 @@ class DroneNavigationEnv:
         reward = self._compute_reward(action)
         done = self._is_done()
 
-        return obs, reward, done, {"goal_reached": np.linalg.norm(self.state.position - self.goal) < 0.5}
+        return (
+            obs,
+            reward,
+            done,
+            {"goal_reached": np.linalg.norm(self.state.position - self.goal) < 0.5},
+        )
 
-    def _get_obs(self) -> NDArray:
+    def _get_obs(self) -> NDArray[np.float64]:
         """Build the observation vector (pos error, velocity, orientation, depths).
 
         Returns:
@@ -1000,15 +1182,17 @@ class DroneNavigationEnv:
         pos_err = self.state.position - self.goal
         euler = self.state.euler_angles
         depth_readings = self._cast_depth_rays()
-        return np.concatenate([
-            pos_err,
-            self.state.velocity,
-            euler,
-            self.state.omega,
-            depth_readings,
-        ])
+        return np.concatenate(
+            [
+                pos_err,
+                self.state.velocity,
+                euler,
+                self.state.omega,
+                depth_readings,
+            ]
+        )
 
-    def _cast_depth_rays(self) -> NDArray:
+    def _cast_depth_rays(self) -> NDArray[np.float64]:
         """Simple ray casting for depth readings."""
         depths = np.full(self.n_depth_rays, 5.0)
         angles = np.linspace(0, 2 * np.pi, self.n_depth_rays, endpoint=False)
@@ -1024,7 +1208,7 @@ class DroneNavigationEnv:
 
         return depths
 
-    def _compute_reward(self, action: NDArray) -> float:
+    def _compute_reward(self, action: NDArray[np.floating]) -> float:
         """Compute the navigation reward for the current timestep.
 
         Args:
@@ -1034,7 +1218,7 @@ class DroneNavigationEnv:
             Scalar reward combining progress, collision penalty, time cost,
             action cost, and a goal-reached bonus.
         """
-        dist = np.linalg.norm(self.state.position - self.goal)
+        dist = float(np.linalg.norm(self.state.position - self.goal))
         progress = self.prev_dist - dist
         self.prev_dist = dist
 
@@ -1062,17 +1246,17 @@ class DroneNavigationEnv:
             return True
         if not self.grid.is_free_world(self.state.position):
             return True
-        if np.linalg.norm(self.state.position - self.goal) < 0.5:
-            return True
-        return False
+        return bool(np.linalg.norm(self.state.position - self.goal) < 0.5)
 
-    def _sample_free_point(self) -> NDArray:
+    def _sample_free_point(self) -> NDArray[np.float64]:
         """Sample a random free point in the grid."""
         for _ in range(1000):
             lo = self.grid.origin + self.grid.resolution * 3
-            hi = (self.grid.origin
-                  + np.array(self.grid.shape) * self.grid.resolution
-                  - self.grid.resolution * 3)
+            hi = (
+                self.grid.origin
+                + np.array(self.grid.shape) * self.grid.resolution
+                - self.grid.resolution * 3
+            )
             point = lo + self.rng.rand(3) * (hi - lo)
             if self.grid.is_free_world(point):
                 return point

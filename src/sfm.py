@@ -56,26 +56,23 @@ References
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import least_squares
-from scipy.spatial.transform import Rotation
 
+from ._cv import solve_pnp_ransac
 from .features import (
-    MatchPair,
-    compute_essential,
-    compute_fundamental_8point,
-    decompose_essential,
     choose_pose_cheirality,
+    compute_essential,
+    decompose_essential,
     ransac_fundamental,
     triangulate_dlt,
 )
-from .transforms import se3_from_Rt, se3_inverse, so3_exp, so3_log
-
+from .transforms import se3_from_Rt, se3_inverse
 
 # ======================================================================
 #  Type aliases
@@ -90,23 +87,28 @@ Points3D = NDArray[np.floating]
 #  Data containers
 # ======================================================================
 
+
 @dataclass
 class ImageData:
     """Feature and match data associated with a single image."""
-    keypoints: NDArray[np.float64]         # (N, 2) keypoint pixel coordinates
-    descriptors: Optional[NDArray] = None  # (N, D) descriptor array
+
+    keypoints: NDArray[np.float64]  # (N, 2) keypoint pixel coordinates
+    descriptors: NDArray[np.floating] | None = None  # (N, D) descriptor array
     # Mapping from local keypoint idx to global 3-D point idx (-1 = unassigned)
-    point_indices: NDArray[np.intp] = field(default_factory=lambda: np.array([], dtype=np.intp))
+    point_indices: NDArray[np.intp] = field(
+        default_factory=lambda: np.array([], dtype=np.intp)
+    )
 
 
 @dataclass
 class MatchData:
     """Pairwise match data between two images."""
+
     img1_id: int
     img2_id: int
     idx1: NDArray[np.intp]  # indices into img1 keypoints
     idx2: NDArray[np.intp]  # indices into img2 keypoints
-    inlier_mask: Optional[NDArray[np.bool_]] = None
+    inlier_mask: NDArray[np.bool_] | None = None
 
 
 # ======================================================================
@@ -115,10 +117,10 @@ class MatchData:
 
 
 def _ba_pack_parameters(
-    cameras: Dict[int, NDArray[np.float64]],
-    cam_ids: List[int],
-    cam_id_to_idx: Dict[int, int],
-    points_3d: List[NDArray[np.float64]],
+    cameras: dict[int, NDArray[np.float64]],
+    cam_ids: list[int],
+    cam_id_to_idx: dict[int, int],
+    points_3d: list[NDArray[np.float64]],
 ) -> NDArray[np.float64]:
     """Pack camera and point parameters into a single flat vector."""
     n_cameras = len(cam_ids)
@@ -130,8 +132,8 @@ def _ba_pack_parameters(
         R_wc = T_wc[:3, :3]
         t_wc = T_wc[:3, 3]
         rvec, _ = cv2.Rodrigues(R_wc)
-        cam_params[6 * idx: 6 * idx + 3] = rvec.ravel()
-        cam_params[6 * idx + 3: 6 * idx + 6] = t_wc
+        cam_params[6 * idx : 6 * idx + 3] = rvec.ravel()
+        cam_params[6 * idx + 3 : 6 * idx + 6] = t_wc
     point_params = np.array(points_3d, dtype=np.float64).ravel()
     return np.concatenate([cam_params, point_params])
 
@@ -146,8 +148,8 @@ def _ba_compute_residuals(
     K: NDArray[np.float64],
 ) -> NDArray[np.float64]:
     """Compute the 2-D reprojection residual vector for all observations."""
-    cams = x[:6 * n_cameras].reshape(n_cameras, 6)
-    pts = x[6 * n_cameras:].reshape(n_points, 3)
+    cams = x[: 6 * n_cameras].reshape(n_cameras, 6)
+    pts = x[6 * n_cameras :].reshape(n_points, 3)
 
     residual_vec = np.zeros(2 * len(obs_cam_idx), dtype=np.float64)
     for k in range(len(obs_cam_idx)):
@@ -158,17 +160,18 @@ def _ba_compute_residuals(
         R_k, _ = cv2.Rodrigues(rvec_k)
         X_cam = R_k @ pts[pi] + tvec_k
         if X_cam[2] < 1e-8:
-            residual_vec[2 * k: 2 * k + 2] = 0.0
+            residual_vec[2 * k : 2 * k + 2] = 0.0
             continue
         proj = K @ X_cam
         proj_2d = proj[:2] / proj[2]
-        residual_vec[2 * k: 2 * k + 2] = proj_2d - obs_2d_arr[k]
+        residual_vec[2 * k : 2 * k + 2] = proj_2d - obs_2d_arr[k]
     return residual_vec
 
 
 # ======================================================================
 #  IncrementalSfM
 # ======================================================================
+
 
 class IncrementalSfM:
     r"""Incremental Structure from Motion pipeline.
@@ -217,19 +220,19 @@ class IncrementalSfM:
         self.K: NDArray[np.float64] = np.asarray(K, dtype=np.float64)
 
         # Registered cameras: img_id → 4×4 camera-to-world SE(3)
-        self.cameras: Dict[int, NDArray[np.float64]] = {}
+        self.cameras: dict[int, NDArray[np.float64]] = {}
 
         # Global 3-D point cloud
-        self.points_3d: List[NDArray[np.float64]] = []
+        self.points_3d: list[NDArray[np.float64]] = []
 
         # observations[img_id] → list of (kp_idx, point3d_idx)
-        self.observations: Dict[int, List[Tuple[int, int]]] = {}
+        self.observations: dict[int, list[tuple[int, int]]] = {}
 
         # Per-image feature data
-        self._images: Dict[int, ImageData] = {}
+        self._images: dict[int, ImageData] = {}
 
         # Pairwise matches: (img1, img2) → MatchData
-        self._matches: Dict[Tuple[int, int], MatchData] = {}
+        self._matches: dict[tuple[int, int], MatchData] = {}
 
         self._registered: set[int] = set()
 
@@ -241,7 +244,7 @@ class IncrementalSfM:
         self,
         img_id: int,
         keypoints: NDArray[np.float64],
-        descriptors: Optional[NDArray] = None,
+        descriptors: NDArray[np.floating] | None = None,
     ) -> None:
         """Register image features.
 
@@ -265,7 +268,7 @@ class IncrementalSfM:
         self,
         img1_id: int,
         img2_id: int,
-        matches: Sequence[Tuple[int, int]],
+        matches: Sequence[tuple[int, int]],
         kp1: NDArray[np.float64],
         kp2: NDArray[np.float64],
     ) -> None:
@@ -347,15 +350,21 @@ class IncrementalSfM:
         t_list = [d[1] for d in decompositions]
 
         R_best, t_best = choose_pose_cheirality(
-            R_list, t_list, inlier_pts1, inlier_pts2, self.K,
+            R_list,
+            t_list,
+            inlier_pts1,
+            inlier_pts2,
+            self.K,
         )
 
-        # Camera 1 at origin
+        # Camera 1 at origin.  (R_best, t_best) maps camera-1 (world) coords
+        # to camera-2 coords, so store the *inverse* to keep the documented
+        # camera-to-world convention used by register_image/bundle_adjust.
         T1 = np.eye(4, dtype=np.float64)
-        T2 = se3_from_Rt(R_best, t_best)
+        T2_w2c = se3_from_Rt(R_best, t_best)
 
         self.cameras[id1] = T1
-        self.cameras[id2] = T2
+        self.cameras[id2] = se3_inverse(T2_w2c)
         self._registered.update({id1, id2})
         self.observations[id1] = []
         self.observations[id2] = []
@@ -408,26 +417,22 @@ class IncrementalSfM:
         if img_id in self._registered:
             return True
 
-        pts_3d_list: List[NDArray] = []
-        pts_2d_list: List[NDArray] = []
-        kp_indices: List[int] = []
+        pts_3d_list: list[NDArray[np.float64]] = []
+        pts_2d_list: list[NDArray[np.float64]] = []
+        kp_indices: list[int] = []
 
         img_data = self._images[img_id]
 
         for (id1, id2), md in self._matches.items():
-            partner = None
             if id1 == img_id and id2 in self._registered:
-                partner = id2
-                my_idx, their_idx = md.idx1, md.idx2
+                partner, my_idx, their_idx = id2, md.idx1, md.idx2
             elif id2 == img_id and id1 in self._registered:
-                partner = id1
-                my_idx, their_idx = md.idx2, md.idx1
-
-            if partner is None:
+                partner, my_idx, their_idx = id1, md.idx2, md.idx1
+            else:
                 continue
 
             partner_data = self._images[partner]
-            for mi, ti in zip(my_idx, their_idx):
+            for mi, ti in zip(my_idx, their_idx, strict=False):
                 pt3d_idx = partner_data.point_indices[ti]
                 if pt3d_idx >= 0 and img_data.point_indices[mi] < 0:
                     pts_3d_list.append(self.points_3d[pt3d_idx])
@@ -440,19 +445,23 @@ class IncrementalSfM:
         obj_pts = np.array(pts_3d_list, dtype=np.float64)
         img_pts = np.array(pts_2d_list, dtype=np.float64)
 
-        ok, rvec, tvec, inliers = cv2.solvePnPRansac(
-            obj_pts, img_pts, self.K,
-            distCoeffs=None,
-            reprojectionError=4.0,
-            iterationsCount=1000,
-            flags=cv2.SOLVEPNP_ITERATIVE,
+        ok, rvec, tvec, inliers = solve_pnp_ransac(
+            obj_pts,
+            img_pts,
+            np.asarray(self.K, dtype=np.float64),
+            np.zeros(5, dtype=np.float64),
+            reprojection_error=4.0,
+            iterations=1000,
         )
 
         if not ok or inliers is None:
             return False
 
         R, _ = cv2.Rodrigues(rvec)
-        T_world_to_cam = se3_from_Rt(R, tvec.ravel())
+        T_world_to_cam = se3_from_Rt(
+            np.asarray(R, dtype=np.float64),
+            np.asarray(tvec, dtype=np.float64).ravel(),
+        )
         T_cam_to_world = se3_inverse(T_world_to_cam)
 
         self.cameras[img_id] = T_cam_to_world
@@ -460,12 +469,18 @@ class IncrementalSfM:
         self.observations[img_id] = []
 
         # Record observations for PnP inliers
-        inlier_set = set(inliers.ravel().tolist())
+        inlier_set = {int(x) for x in np.asarray(inliers).ravel().tolist()}
         for i in inlier_set:
             kp_i = kp_indices[i]
-            pt3d_idx = int(np.where(
-                np.all(np.array(self.points_3d) == obj_pts[i], axis=1)
-            )[0][0]) if len(self.points_3d) > 0 else -1
+            pt3d_idx = (
+                int(
+                    np.where(np.all(np.array(self.points_3d) == obj_pts[i], axis=1))[0][
+                        0
+                    ]
+                )
+                if len(self.points_3d) > 0
+                else -1
+            )
 
             if pt3d_idx >= 0:
                 img_data.point_indices[kp_i] = pt3d_idx
@@ -516,9 +531,9 @@ class IncrementalSfM:
         n_points = len(self.points_3d)
 
         # Gather all observations
-        obs_cam_idx: List[int] = []
-        obs_pt_idx: List[int] = []
-        obs_2d: List[NDArray] = []
+        obs_cam_idx: list[int] | NDArray[np.intp] = []
+        obs_pt_idx: list[int] | NDArray[np.intp] = []
+        obs_2d: list[NDArray[np.float64]] = []
 
         for cid in cam_ids:
             for kp_idx, pt_idx in self.observations.get(cid, []):
@@ -535,22 +550,31 @@ class IncrementalSfM:
         obs_2d_arr = np.array(obs_2d, dtype=np.float64)
 
         x0 = _ba_pack_parameters(
-            self.cameras, cam_ids, cam_id_to_idx, self.points_3d,
+            self.cameras,
+            cam_ids,
+            cam_id_to_idx,
+            self.points_3d,
         )
         K = self.K
 
         result = least_squares(
             lambda x: _ba_compute_residuals(
-                x, n_cameras, n_points,
-                obs_cam_idx, obs_pt_idx, obs_2d_arr, K,
+                x,
+                n_cameras,
+                n_points,
+                obs_cam_idx,
+                obs_pt_idx,
+                obs_2d_arr,
+                K,
             ),
-            x0, method="lm",
+            x0,
+            method="lm",
             max_nfev=max_iterations * len(x0),
         )
 
         # Unpack results
-        cams_opt = result.x[:6 * n_cameras].reshape(n_cameras, 6)
-        pts_opt = result.x[6 * n_cameras:].reshape(n_points, 3)
+        cams_opt = result.x[: 6 * n_cameras].reshape(n_cameras, 6)
+        pts_opt = result.x[6 * n_cameras :].reshape(n_points, 3)
 
         for cid in cam_ids:
             idx = cam_id_to_idx[cid]
@@ -562,12 +586,12 @@ class IncrementalSfM:
 
         self.points_3d = [pts_opt[i] for i in range(n_points)]
 
-        mean_reproj = float(np.sqrt(np.mean(result.fun ** 2)))
+        mean_reproj = float(np.sqrt(np.mean(result.fun**2)))
         return mean_reproj
 
     def get_reconstruction(
         self,
-    ) -> Tuple[Dict[int, NDArray[np.float64]], NDArray[np.float64]]:
+    ) -> tuple[dict[int, NDArray[np.float64]], NDArray[np.float64]]:
         """Return the current reconstruction.
 
         Returns
@@ -577,7 +601,11 @@ class IncrementalSfM:
         points_3d : ndarray, shape (M, 3)
             Reconstructed 3-D point cloud.
         """
-        pts = np.array(self.points_3d, dtype=np.float64) if self.points_3d else np.zeros((0, 3))
+        pts = (
+            np.array(self.points_3d, dtype=np.float64)
+            if self.points_3d
+            else np.zeros((0, 3))
+        )
         return dict(self.cameras), pts
 
     # ------------------------------------------------------------------
@@ -592,15 +620,11 @@ class IncrementalSfM:
         P_this = self.K @ T_this_inv[:3]
 
         for (id1, id2), md in self._matches.items():
-            partner = None
             if id1 == img_id and id2 in self._registered:
-                partner = id2
-                my_idx, their_idx = md.idx1, md.idx2
+                partner, my_idx, their_idx = id2, md.idx1, md.idx2
             elif id2 == img_id and id1 in self._registered:
-                partner = id1
-                my_idx, their_idx = md.idx2, md.idx1
-
-            if partner is None:
+                partner, my_idx, their_idx = id1, md.idx2, md.idx1
+            else:
                 continue
 
             partner_data = self._images[partner]
@@ -608,14 +632,14 @@ class IncrementalSfM:
             T_partner_inv = se3_inverse(T_partner)
             P_partner = self.K @ T_partner_inv[:3]
 
-            for mi, ti in zip(my_idx, their_idx):
+            for mi, ti in zip(my_idx, their_idx, strict=False):
                 if img_data.point_indices[mi] >= 0:
                     continue
                 if partner_data.point_indices[ti] >= 0:
                     continue
 
-                pt1 = img_data.keypoints[mi:mi + 1]
-                pt2 = partner_data.keypoints[ti:ti + 1]
+                pt1 = img_data.keypoints[mi : mi + 1]
+                pt2 = partner_data.keypoints[ti : ti + 1]
 
                 X = triangulate_dlt(pt1, pt2, P_this, P_partner)
 
@@ -635,16 +659,17 @@ class IncrementalSfM:
 
     # -- Plan-compatible aliases --
 
-    def add_images(self, images: list) -> None:
-        """Add multiple images at once."""
+    def add_images(
+        self,
+        images: Sequence[tuple[int, NDArray[np.float64], NDArray[np.floating] | None]],
+    ) -> None:
+        """Add multiple ``(img_id, keypoints[, descriptors])`` entries at once."""
         for img in images:
-            self.add_image(img)
+            self.add_image(*img)
 
     def register_next_image(self) -> bool:
         """Register the next unregistered image with the most 3D-2D matches."""
-        unregistered = [
-            i for i in self._images if i not in self._registered
-        ]
+        unregistered = [i for i in self._images if i not in self._registered]
         if not unregistered:
             return False
         best_id = max(
@@ -658,7 +683,9 @@ class IncrementalSfM:
         if self._registered:
             self._triangulate_new_points(max(self._registered))
 
-    def reconstruct_all(self) -> dict:
+    def reconstruct_all(
+        self,
+    ) -> tuple[dict[int, NDArray[np.float64]], NDArray[np.float64]]:
         """Run full incremental SfM: initialize + register all + BA."""
         ids = sorted(self._images.keys())
         if len(ids) < 2:

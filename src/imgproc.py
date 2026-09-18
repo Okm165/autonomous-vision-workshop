@@ -19,10 +19,10 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-
 # ---------------------------------------------------------------------------
 # 1. 2-D Convolution
 # ---------------------------------------------------------------------------
+
 
 def convolve2d(
     image: NDArray[np.floating],
@@ -92,6 +92,7 @@ def _convolve2d_single(
 # 2. Gaussian Kernel
 # ---------------------------------------------------------------------------
 
+
 def gaussian_kernel(size: int, sigma: float) -> NDArray[np.float64]:
     r"""Generate a normalised 2-D Gaussian kernel.
 
@@ -124,8 +125,8 @@ def gaussian_kernel(size: int, sigma: float) -> NDArray[np.float64]:
     ax = np.arange(-half, half + 1, dtype=np.float64)
     xx, yy = np.meshgrid(ax, ax)
 
-    kernel = np.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2))
-    kernel /= 2.0 * np.pi * sigma ** 2
+    kernel = np.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
+    kernel /= 2.0 * np.pi * sigma**2
     kernel /= kernel.sum()
     return kernel
 
@@ -133,6 +134,7 @@ def gaussian_kernel(size: int, sigma: float) -> NDArray[np.float64]:
 # ---------------------------------------------------------------------------
 # 3. Sobel Gradients
 # ---------------------------------------------------------------------------
+
 
 def sobel_gradients(
     image: NDArray[np.floating],
@@ -159,6 +161,14 @@ def sobel_gradients(
         M = \sqrt{G_x^{2} + G_y^{2}},\qquad
         \theta = \operatorname{atan2}(G_y,\; G_x)
 
+    Note: :func:`convolve2d` performs a *true* convolution (kernel
+    flipped), while the standard Sobel masks shown above are written in
+    correlation form.  We therefore rotate each mask by 180° before
+    calling :func:`convolve2d` so that the returned ``gradient_x`` /
+    ``gradient_y`` are the actual partial derivatives
+    :math:`\partial I / \partial x`, :math:`\partial I / \partial y`
+    (e.g. ``gx = 8a`` for an intensity ramp ``I = a·x``).
+
     Parameters
     ----------
     image : ndarray, shape (H, W)
@@ -175,23 +185,28 @@ def sobel_gradients(
         image = np.mean(image, axis=2)
     image = image.astype(np.float64)
 
-    sobel_x = np.array([[-1, 0, 1],
-                         [-2, 0, 2],
-                         [-1, 0, 1]], dtype=np.float64)
-    sobel_y = np.array([[-1, -2, -1],
-                         [ 0,  0,  0],
-                         [ 1,  2,  1]], dtype=np.float64)
+    # 180°-rotated Sobel masks: convolving with these is equivalent to
+    # correlating with the standard masks S_x / S_y (true convolution
+    # flips the kernel), which yields the true derivative signs.
+    sobel_x = np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=np.float64)
+    sobel_y = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=np.float64)
 
     gx = convolve2d(image, sobel_x)
     gy = convolve2d(image, sobel_y)
-    magnitude = np.sqrt(gx ** 2 + gy ** 2)
+    magnitude = np.sqrt(gx**2 + gy**2)
     direction = np.arctan2(gy, gx)
-    return gx, gy, magnitude, direction
+    return (
+        np.asarray(gx, dtype=np.float64),
+        np.asarray(gy, dtype=np.float64),
+        np.asarray(magnitude, dtype=np.float64),
+        np.asarray(direction, dtype=np.float64),
+    )
 
 
 # ---------------------------------------------------------------------------
 # 4. Canny Edge Detector
 # ---------------------------------------------------------------------------
+
 
 def canny_edges(
     image: NDArray[np.floating],
@@ -303,16 +318,20 @@ def _hysteresis(
         changed = False
         for y in range(1, edges.shape[0] - 1):
             for x in range(1, edges.shape[1] - 1):
-                if weak[y, x] and edges[y, x] == 0:
-                    if np.any(edges[y - 1 : y + 2, x - 1 : x + 2] == 255):
-                        edges[y, x] = 255
-                        changed = True
+                if (
+                    weak[y, x]
+                    and edges[y, x] == 0
+                    and np.any(edges[y - 1 : y + 2, x - 1 : x + 2] == 255)
+                ):
+                    edges[y, x] = 255
+                    changed = True
     return edges
 
 
 # ---------------------------------------------------------------------------
 # 5. Gaussian Pyramid
 # ---------------------------------------------------------------------------
+
 
 def build_gaussian_pyramid(
     image: NDArray[np.floating],
@@ -345,11 +364,8 @@ def build_gaussian_pyramid(
 
     for _ in range(1, levels):
         blurred = convolve2d(pyramid[-1], gk)
-        if blurred.ndim == 3:
-            downsampled = blurred[::2, ::2, :]
-        else:
-            downsampled = blurred[::2, ::2]
-        pyramid.append(downsampled)
+        downsampled = blurred[::2, ::2, :] if blurred.ndim == 3 else blurred[::2, ::2]
+        pyramid.append(np.asarray(downsampled, dtype=np.float64))
     return pyramid
 
 
@@ -357,7 +373,10 @@ def build_gaussian_pyramid(
 # 6. Laplacian Pyramid
 # ---------------------------------------------------------------------------
 
-def _upsample(image: NDArray[np.float64], target_shape: tuple[int, ...]) -> NDArray[np.float64]:
+
+def _upsample(
+    image: NDArray[np.float64], target_shape: tuple[int, ...]
+) -> NDArray[np.float64]:
     """Upsample *image* to *target_shape* using zero-insertion + Gaussian blur.
 
     Insert zeros between every sample, then convolve with a 5×5 Gaussian
@@ -372,7 +391,7 @@ def _upsample(image: NDArray[np.float64], target_shape: tuple[int, ...]) -> NDAr
         upsampled[::2, ::2] = image[: (th + 1) // 2, : (tw + 1) // 2]
 
     gk = gaussian_kernel(5, 1.0) * 4.0
-    return convolve2d(upsampled, gk)
+    return np.asarray(convolve2d(upsampled, gk), dtype=np.float64)
 
 
 def build_laplacian_pyramid(
@@ -450,7 +469,8 @@ def reconstruct_from_laplacian(
 # 7. Histogram Equalisation
 # ---------------------------------------------------------------------------
 
-def histogram_equalize(image: NDArray) -> NDArray[np.uint8]:
+
+def histogram_equalize(image: NDArray[np.uint8]) -> NDArray[np.uint8]:
     r"""Histogram equalisation for contrast enhancement.
 
     For a grayscale image with *L* intensity levels the transform is:

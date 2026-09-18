@@ -32,7 +32,34 @@ uv sync --extra gpu
 
 # Launch Jupyter
 uv run jupyter notebook notebooks/
+
+# Fetch the external datasets (idempotent; skips what is already present)
+bash data/download.sh
 ```
+
+### Quality gates
+
+Every tool runs from the workspace's own `.venv` — `uv sync` installs
+`basedpyright` and `ruff` into the dev dependency group, so no global installs
+are assumed and the editor and the terminal cannot drift apart:
+
+```bash
+.venv/bin/python -m pytest                # 356 tests
+.venv/bin/basedpyright                    # 0 errors, 0 warnings, 0 notes
+.venv/bin/ruff check .                    # lint (incl. notebooks)
+.venv/bin/ruff format --check .           # formatting
+```
+
+Type-checking rules are configured exactly once, in `pyproject.toml` under
+`[tool.basedpyright]`; both the CLI above and the language server inside Zed
+read that same section. `.zed/settings.json` deliberately pins only the
+interpreter (`.venv/bin/python`) and does not restate any rule, so there is a
+single source of truth for diagnostics.
+
+Notebooks are linted but deliberately *not* auto-formatted: reformatting
+rewrites every cell as one implicit module, which reflows the teaching code and
+produces review-hostile diffs. `typings/` holds partial stubs that correct
+upstream packages publishing wrong inline types — see `typings/README.md`.
 
 ## Project Structure
 
@@ -40,6 +67,7 @@ uv run jupyter notebook notebooks/
 autonomus/
   notebooks/           # 24 Jupyter notebooks (the workshop)
   src/                 # Reusable Python library
+    _cv.py             # Typed, failure-tolerant facade over the cv2 bindings
     imgproc.py         # Convolution, filtering, edge detection, pyramids
     projective.py      # Homographies, vanishing points, cross-ratio
     camera.py          # Pinhole model, calibration, PnP, triangulation
@@ -58,15 +86,28 @@ autonomus/
     slam.py            # Pose graph optimization, bundle adjustment
     gaussian_splatting.py  # 3DGS forward model & rendering
     semantic.py        # Semantic segmentation + semantic TSDF
-    pipeline.py        # Full mapping pipeline orchestrator
+    pipeline.py         # Full mapping pipeline orchestrator
     eval.py            # ATE, RPE, depth metrics, Umeyama alignment
     viz.py             # 3D visualization helpers
     drone.py           # Quadrotor dynamics, PID & SE(3) control
     path_planning.py   # A*, RRT/RRT*, APF for 3D navigation
     rl_agents.py       # PPO, SAC reinforcement learning agents
-  data/                # Sample data and download scripts
+  tests/               # 356 unit tests incl. dataset I/O pins (pytest)
+  typings/             # Partial stubs correcting wrong upstream types
+  .zed/settings.json   # Pins Zed's interpreter to .venv (see Quality gates)
+  data/                # Sample data + downloaders (see data/download.sh)
+    download.sh        # Idempotent fetch of all external datasets
+    fetch_kitti_frames.py  # Ranged extraction of KITTI seq 00 from S3
   pyproject.toml       # Dependencies (managed by uv)
 ```
+
+### Notebook math conventions
+
+Inline math uses `\(...\)` and display math uses `$$...$$` — the only pair of
+delimiters supported by every Jupyter explorer (classic notebook, JupyterLab,
+nbconvert HTML) as well as Zed and KaTeX auto-render defaults.  Single `$` is
+never used for inline math (unsupported in nbclassic), and `|` inside table-row
+math is written `\vert` so GFM tables do not split on it.
 
 ## Mathematical Philosophy
 
@@ -80,7 +121,7 @@ Every derivation is shown step-by-step, not just stated. Key mathematical tools:
 
 ## Prerequisites
 
-- Python 3.10+
+- Python 3.11+
 - Linear algebra (matrices, eigenvalues, SVD)
 - Basic calculus (gradients, Taylor expansions)
 - NumPy fluency
@@ -140,7 +181,7 @@ Based on 100+ seminal papers and standard textbooks:
 - Kaufmann et al., "Champion-level drone racing using deep reinforcement learning" (Nature 2023)
 - Loquercio et al., "Learning High-Speed Flight in the Wild" (Science Robotics 2021)
 
-See the plan file for the complete 100+ reference list grouped by topic.
+Each notebook states the specific papers its derivations follow.
 
 ## License
 

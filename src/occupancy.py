@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import List, Tuple
-
 import numpy as np
 from numpy.typing import NDArray
 
@@ -52,9 +50,18 @@ class OccupancyGrid:
         overconfidence.
     """
 
+    bounds: NDArray[np.float64]
+    resolution: float
+    log_odds_free: float
+    log_odds_occ: float
+    log_odds_max: float
+    origin: NDArray[np.float64]
+    grid_size: NDArray[np.int_]
+    grid: NDArray[np.float64]
+
     def __init__(
         self,
-        bounds: NDArray,
+        bounds: NDArray[np.float64],
         resolution: float = 0.1,
         log_odds_free: float = -0.4,
         log_odds_occ: float = 0.85,
@@ -62,6 +69,19 @@ class OccupancyGrid:
     ) -> None:
         """Initialise the occupancy grid with bounds and log-odds parameters."""
         self.bounds = np.asarray(bounds, dtype=np.float64)  # (3, 2)
+        if self.bounds.shape == (2, 3):
+            # Accept the (min, max) row convention as well as the documented
+            # (3, 2) column convention.
+            self.bounds = self.bounds.T
+        if self.bounds.shape != (3, 2):
+            raise ValueError(
+                "bounds must have shape (3, 2) as "
+                "[[x_min, x_max], [y_min, y_max], [z_min, z_max]], "
+                f"got {self.bounds.shape}"
+            )
+        if np.any(self.bounds[:, 1] <= self.bounds[:, 0]):
+            raise ValueError("bounds max must exceed min on every axis")
+
         self.resolution = resolution
         self.log_odds_free = log_odds_free
         self.log_odds_occ = log_odds_occ
@@ -134,7 +154,7 @@ class OccupancyGrid:
 
         np.clip(self.grid, -self.log_odds_max, self.log_odds_max, out=self.grid)
 
-    def get_occupied_points(self, threshold: float = 0.5) -> NDArray:
+    def get_occupied_points(self, threshold: float = 0.5) -> NDArray[np.float64]:
         """Return (N, 3) array of voxel centres with p(occ) > *threshold*.
 
         Conversion from log-odds:
@@ -144,7 +164,7 @@ class OccupancyGrid:
         ix, iy, iz = np.where(self.grid > log_thresh)
         return self._voxel_indices_to_world(ix, iy, iz)
 
-    def get_free_points(self, threshold: float = 0.3) -> NDArray:
+    def get_free_points(self, threshold: float = 0.3) -> NDArray[np.float64]:
         """Return (N, 3) array of voxel centres with p(occ) < *threshold*."""
         log_thresh = np.log(threshold / (1.0 - threshold))
         ix, iy, iz = np.where(self.grid < log_thresh)
@@ -166,7 +186,7 @@ class OccupancyGrid:
         log_thresh = np.log(threshold / (1.0 - threshold))
         return bool(self.grid[idx] > log_thresh)
 
-    def get_free_mask(self) -> NDArray:
+    def get_free_mask(self) -> NDArray[np.bool_]:
         """Return a boolean mask of free voxels (log-odds below free threshold)."""
         log_free = np.log(0.3 / 0.7)
         return self.grid < log_free
@@ -176,19 +196,21 @@ class OccupancyGrid:
         origin: np.ndarray,
         direction: np.ndarray,
         max_range: float,
-    ) -> Tuple[np.ndarray | None, float]:
+    ) -> tuple[np.ndarray | None, float]:
         """Cast a ray and return (hit_point, distance) or (None, max_range) if no hit."""
         direction = np.asarray(direction, dtype=np.float64)
         direction = direction / np.linalg.norm(direction)
         origin = np.asarray(origin, dtype=np.float64)
-        step = self.resolution * 0.5  # half-voxel steps to avoid missing diagonal traversals
+        step = (
+            self.resolution * 0.5
+        )  # half-voxel steps to avoid missing diagonal traversals
         for t in np.arange(0, max_range, step):
             point = origin + direction * t
             if self.is_occupied(point):
                 return point, float(t)
         return None, max_range
 
-    def to_probability(self) -> NDArray:
+    def to_probability(self) -> NDArray[np.float64]:
         """Convert the full log-odds grid to a probability grid.
 
         p(x) = 1 - 1 / (1 + exp(l(x)))
@@ -203,9 +225,9 @@ class OccupancyGrid:
 
     def _bresenham_3d(
         self,
-        start: Tuple[int, int, int],
-        end: Tuple[int, int, int],
-    ) -> List[Tuple[int, int, int]]:
+        start: tuple[int, int, int],
+        end: tuple[int, int, int],
+    ) -> list[tuple[int, int, int]]:
         """3D Bresenham line algorithm for ray casting.
 
         Returns a list of (ix, iy, iz) voxel indices visited along
@@ -226,7 +248,7 @@ class OccupancyGrid:
         sy = 1 if y1 > y0 else -1
         sz = 1 if z1 > z0 else -1
 
-        points: List[Tuple[int, int, int]] = []
+        points: list[tuple[int, int, int]] = []
 
         if dx >= dy and dx >= dz:
             ey = 2 * dy - dx
@@ -282,19 +304,22 @@ class OccupancyGrid:
     # Coordinate helpers
     # ------------------------------------------------------------------
 
-    def _world_to_voxel(self, point: NDArray) -> Tuple[int, int, int]:
+    def _world_to_voxel(self, point: NDArray[np.float64]) -> tuple[int, int, int]:
         """Map a world-frame point to integer voxel indices."""
         idx = ((point - self.origin) / self.resolution).astype(int)
         return int(idx[0]), int(idx[1]), int(idx[2])
 
     def _voxel_indices_to_world(
-        self, ix: NDArray, iy: NDArray, iz: NDArray
-    ) -> NDArray:
+        self,
+        ix: NDArray[np.int64],
+        iy: NDArray[np.int64],
+        iz: NDArray[np.int64],
+    ) -> NDArray[np.float64]:
         """Convert arrays of voxel indices to (N, 3) world-frame centres."""
         coords = np.stack([ix, iy, iz], axis=-1).astype(np.float64)
         return self.origin + (coords + 0.5) * self.resolution
 
-    def _in_bounds(self, voxel: Tuple[int, int, int]) -> bool:
+    def _in_bounds(self, voxel: tuple[int, int, int]) -> bool:
         """Check whether *voxel* lies inside the grid."""
         return all(0 <= voxel[i] < self.grid_size[i] for i in range(3))
 

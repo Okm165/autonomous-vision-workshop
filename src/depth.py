@@ -8,20 +8,21 @@ this by learning geometric priors from large-scale training data.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, ClassVar
 
 import cv2
 import numpy as np
-
 
 # ---------------------------------------------------------------------------
 # Lazy imports for heavy optional dependencies
 # ---------------------------------------------------------------------------
 
+
 def _import_torch():
     """Import and return the ``torch`` module, raising if unavailable."""
     try:
-        import torch
+        import torch  # pyright: ignore[reportMissingImports]
+
         return torch
     except ImportError as exc:
         raise ImportError(
@@ -33,7 +34,8 @@ def _import_torch():
 def _import_transformers():
     """Import and return the ``transformers`` module, raising if unavailable."""
     try:
-        import transformers
+        import transformers  # pyright: ignore[reportMissingImports]
+
         return transformers
     except ImportError as exc:
         raise ImportError(
@@ -45,6 +47,7 @@ def _import_transformers():
 # ---------------------------------------------------------------------------
 # DepthEstimator
 # ---------------------------------------------------------------------------
+
 
 class DepthEstimator:
     """
@@ -88,7 +91,10 @@ class DepthEstimator:
     - IMU + visual-inertial scale factor
     """
 
-    _SUPPORTED_BACKENDS = {"depth_anything_v2", "midas"}
+    _SUPPORTED_BACKENDS: ClassVar[set[str]] = {"depth_anything_v2", "midas"}
+
+    backend: str
+    device: str
 
     def __init__(
         self,
@@ -113,8 +119,8 @@ class DepthEstimator:
 
         self.backend = backend
         self.device = device
-        self._model = None
-        self._transform = None
+        self._model: Any | None = None
+        self._transform: Any | None = None
 
     def _load_model(self) -> None:
         """Lazy-load the model on first prediction."""
@@ -142,13 +148,19 @@ class DepthEstimator:
 
     def _load_midas(self, torch) -> None:
         """Load the MiDaS small model from torch hub."""
-        self._model = torch.hub.load(
-            "intel-isl/MiDaS", "MiDaS_small", trust_repo=True,
+        model = torch.hub.load(
+            "intel-isl/MiDaS",
+            "MiDaS_small",
+            trust_repo=True,
         )
-        self._model.to(self.device).eval()
+        assert model is not None, "MiDaS model failed to load from torch.hub"
+        model.to(self.device).eval()
+        self._model = model
 
         midas_transforms = torch.hub.load(
-            "intel-isl/MiDaS", "transforms", trust_repo=True,
+            "intel-isl/MiDaS",
+            "transforms",
+            trust_repo=True,
         )
         self._transform = midas_transforms.small_transform
 
@@ -170,6 +182,7 @@ class DepthEstimator:
             (H, W) float32 array of relative (inverse) depth values.
         """
         self._load_model()
+        assert self._model is not None, "depth model failed to load"
 
         torch = _import_torch()
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -183,11 +196,13 @@ class DepthEstimator:
             depth = np.array(depth_pil, dtype=np.float32)
             if depth.shape[:2] != image.shape[:2]:
                 depth = cv2.resize(
-                    depth, (image.shape[1], image.shape[0]),
+                    depth,
+                    (image.shape[1], image.shape[0]),
                     interpolation=cv2.INTER_LINEAR,
                 )
             return depth
 
+        assert self._transform is not None, "MiDaS transform failed to load"
         input_tensor = self._transform(rgb).to(self.device)
         with torch.no_grad():
             prediction = self._model(input_tensor)
@@ -268,11 +283,12 @@ class DepthEstimator:
 # Depth map utilities
 # ---------------------------------------------------------------------------
 
+
 def align_depth_to_ground_truth(
     predicted: np.ndarray,
     ground_truth: np.ndarray,
-    mask: Optional[np.ndarray] = None,
-) -> Tuple[float, float, np.ndarray]:
+    mask: np.ndarray | None = None,
+) -> tuple[float, float, np.ndarray]:
     """
     Compute optimal scale and shift to align predicted depth to ground truth.
 
@@ -324,8 +340,8 @@ def align_depth_to_ground_truth(
 def compute_depth_metrics(
     predicted: np.ndarray,
     ground_truth: np.ndarray,
-    mask: Optional[np.ndarray] = None,
-) -> dict:
+    mask: np.ndarray | None = None,
+) -> dict[str, float]:
     """
     Compute standard monocular depth evaluation metrics.
 
@@ -363,24 +379,24 @@ def compute_depth_metrics(
     gt = ground_truth[mask].astype(np.float64)
 
     if len(pred) == 0:
-        return {k: 0.0 for k in (
-            "abs_rel", "sq_rel", "rmse", "rmse_log",
-            "delta_1", "delta_2", "delta_3",
-        )}
+        return dict.fromkeys(
+            ("abs_rel", "sq_rel", "rmse", "rmse_log", "delta_1", "delta_2", "delta_3"),
+            0.0,
+        )
 
     pred = np.clip(pred, 1e-6, None)
 
     diff = np.abs(pred - gt)
 
     abs_rel = float(np.mean(diff / gt))
-    sq_rel = float(np.mean(diff ** 2 / gt))
-    rmse = float(np.sqrt(np.mean(diff ** 2)))
+    sq_rel = float(np.mean(diff**2 / gt))
+    rmse = float(np.sqrt(np.mean(diff**2)))
     rmse_log = float(np.sqrt(np.mean((np.log(pred) - np.log(gt)) ** 2)))
 
     ratio = np.maximum(pred / gt, gt / pred)
     delta_1 = float(np.mean(ratio < 1.25))
-    delta_2 = float(np.mean(ratio < 1.25 ** 2))
-    delta_3 = float(np.mean(ratio < 1.25 ** 3))
+    delta_2 = float(np.mean(ratio < 1.25**2))
+    delta_3 = float(np.mean(ratio < 1.25**3))
 
     return {
         "abs_rel": abs_rel,
@@ -396,8 +412,8 @@ def compute_depth_metrics(
 def colorize_depth(
     depth: np.ndarray,
     cmap: str = "turbo",
-    vmin: Optional[float] = None,
-    vmax: Optional[float] = None,
+    vmin: float | None = None,
+    vmax: float | None = None,
 ) -> np.ndarray:
     """
     Colorize a depth map for visualization.
@@ -420,7 +436,7 @@ def colorize_depth(
     coloured : np.ndarray
         (H, W, 3) uint8 BGR image.
     """
-    import matplotlib.cm as cm
+    import matplotlib
 
     valid = depth[depth > 0] if np.any(depth > 0) else depth.ravel()
     lo = vmin if vmin is not None else float(np.percentile(valid, 2))
@@ -428,6 +444,6 @@ def colorize_depth(
 
     normalised = np.clip((depth - lo) / max(hi - lo, 1e-8), 0.0, 1.0)
 
-    colormap = cm.get_cmap(cmap)
+    colormap = matplotlib.colormaps[cmap]
     coloured = (colormap(normalised)[:, :, :3] * 255).astype(np.uint8)
     return cv2.cvtColor(coloured, cv2.COLOR_RGB2BGR)

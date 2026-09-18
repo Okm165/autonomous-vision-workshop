@@ -24,39 +24,47 @@ import numpy as np
 from numpy.typing import NDArray
 
 
-def _skew(v: NDArray) -> NDArray:
+def _skew(v: NDArray[np.float64]) -> NDArray[np.float64]:
     """Return the 3×3 skew-symmetric matrix [v]× such that [v]× w = v × w."""
-    return np.array([
-        [0.0, -v[2], v[1]],
-        [v[2], 0.0, -v[0]],
-        [-v[1], v[0], 0.0],
-    ])
+    return np.array(
+        [
+            [0.0, -v[2], v[1]],
+            [v[2], 0.0, -v[0]],
+            [-v[1], v[0], 0.0],
+        ]
+    )
 
 
-def _quat_multiply(q: NDArray, r: NDArray) -> NDArray:
+def _quat_multiply(
+    q: NDArray[np.float64], r: NDArray[np.float64]
+) -> NDArray[np.float64]:
     """Hamilton quaternion product q ⊗ r with scalar-first convention [w,x,y,z]."""
     w0, x0, y0, z0 = q
     w1, x1, y1, z1 = r
-    return np.array([
-        w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1,
-        w0 * x1 + x0 * w1 + y0 * z1 - z0 * y1,
-        w0 * y1 - x0 * z1 + y0 * w1 + z0 * x1,
-        w0 * z1 + x0 * y1 - y0 * x1 + z0 * w1,
-    ])
+    return np.array(
+        [
+            w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1,
+            w0 * x1 + x0 * w1 + y0 * z1 - z0 * y1,
+            w0 * y1 - x0 * z1 + y0 * w1 + z0 * x1,
+            w0 * z1 + x0 * y1 - y0 * x1 + z0 * w1,
+        ]
+    )
 
 
-def _quat_to_rotation(q: NDArray) -> NDArray:
+def _quat_to_rotation(q: NDArray[np.float64]) -> NDArray[np.float64]:
     """Convert unit quaternion [w,x,y,z] to 3×3 rotation matrix."""
     q = q / np.linalg.norm(q)
     w, x, y, z = q
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
-        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
-    ])
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ]
+    )
 
 
-def _rotation_to_quat(R: NDArray) -> NDArray:
+def _rotation_to_quat(R: NDArray[np.float64]) -> NDArray[np.float64]:
     """Convert 3×3 rotation matrix to unit quaternion [w,x,y,z] (Shepperd's method)."""
     trace = np.trace(R)
     choices = np.array([trace, R[0, 0], R[1, 1], R[2, 2]])
@@ -91,7 +99,7 @@ def _rotation_to_quat(R: NDArray) -> NDArray:
     return quat * np.sign(quat[0])  # enforce w >= 0
 
 
-def _axis_angle_to_quat(v: NDArray) -> NDArray:
+def _axis_angle_to_quat(v: NDArray[np.float64]) -> NDArray[np.float64]:
     """Convert rotation vector (axis-angle) v ∈ R³ to unit quaternion [w,x,y,z].
 
     q = [cos(θ/2), sin(θ/2)·v̂]  where θ = ‖v‖
@@ -104,7 +112,7 @@ def _axis_angle_to_quat(v: NDArray) -> NDArray:
     return np.array([np.cos(half), *(np.sin(half) * axis)])
 
 
-def _quat_to_axis_angle(q: NDArray) -> NDArray:
+def _quat_to_axis_angle(q: NDArray[np.float64]) -> NDArray[np.float64]:
     """Convert unit quaternion [w,x,y,z] to rotation vector (axis-angle) ∈ R³.
 
     v = 2·arctan2(‖q_v‖, q_w) · q_v̂
@@ -216,6 +224,18 @@ class VIO_EKF:
     _BA: slice = slice(9, 12)
     _BG: slice = slice(12, 15)
 
+    sigma_accel: float
+    sigma_gyro: float
+    sigma_accel_bias: float
+    sigma_gyro_bias: float
+    gravity: NDArray[np.float64]
+    position: NDArray[np.float64]
+    velocity: NDArray[np.float64]
+    quaternion: NDArray[np.float64]
+    accel_bias: NDArray[np.float64]
+    gyro_bias: NDArray[np.float64]
+    P: NDArray[np.float64]
+
     def __init__(
         self,
         sigma_accel: float = 0.1,
@@ -281,9 +301,7 @@ class VIO_EKF:
 
         # --- Nominal state propagation ---
         a_world = R_k @ a_body + self.gravity
-        self.position = (
-            self.position + self.velocity * dt + 0.5 * a_world * dt * dt
-        )
+        self.position = self.position + self.velocity * dt + 0.5 * a_world * dt * dt
         self.velocity = self.velocity + a_world * dt
 
         dq = _axis_angle_to_quat(w_body * dt)
@@ -308,10 +326,10 @@ class VIO_EKF:
         # sigma values are continuous-time noise densities (units/√Hz),
         # so discrete-time covariance = σ² · Δt (not (σ·Δt)²).
         Q = np.zeros((self._DIM_STATE, self._DIM_STATE))
-        Q[self._V, self._V] = np.eye(3) * self.sigma_accel ** 2 * dt
-        Q[self._THETA, self._THETA] = np.eye(3) * self.sigma_gyro ** 2 * dt
-        Q[self._BA, self._BA] = np.eye(3) * self.sigma_accel_bias ** 2 * dt
-        Q[self._BG, self._BG] = np.eye(3) * self.sigma_gyro_bias ** 2 * dt
+        Q[self._V, self._V] = np.eye(3) * self.sigma_accel**2 * dt
+        Q[self._THETA, self._THETA] = np.eye(3) * self.sigma_gyro**2 * dt
+        Q[self._BA, self._BA] = np.eye(3) * self.sigma_accel_bias**2 * dt
+        Q[self._BG, self._BG] = np.eye(3) * self.sigma_gyro_bias**2 * dt
 
         # --- Covariance propagation ---
         self.P = F @ self.P @ F.T + Q
@@ -396,7 +414,7 @@ class VIO_EKF:
     # Accessors
     # ------------------------------------------------------------------
 
-    def get_state(self) -> dict[str, NDArray]:
+    def get_state(self) -> dict[str, NDArray[np.float64]]:
         """Return current state estimate as dict.
 
         Returns
@@ -412,7 +430,7 @@ class VIO_EKF:
             "gyro_bias": self.gyro_bias.copy(),
         }
 
-    def get_covariance(self) -> NDArray:
+    def get_covariance(self) -> NDArray[np.float64]:
         """Return 15×15 state covariance matrix."""
         return self.P.copy()
 
@@ -420,6 +438,7 @@ class VIO_EKF:
 # ======================================================================
 #  IMU data simulator
 # ======================================================================
+
 
 def simulate_imu(
     trajectory_fn,
@@ -429,8 +448,8 @@ def simulate_imu(
     gyro_noise_std: float = 0.01,
     accel_bias_drift: float = 0.001,
     gyro_bias_drift: float = 0.0001,
-    gravity: NDArray = np.array([0.0, 0.0, -9.81]),
-) -> dict:
+    gravity: NDArray[np.float64] = np.array([0.0, 0.0, -9.81]),
+) -> dict[str, NDArray[np.floating] | list[NDArray[np.floating]]]:
     """Generate synthetic IMU measurements from a trajectory function.
 
     Parameters
@@ -479,24 +498,32 @@ def simulate_imu(
         gt_rotations.append(R.copy())
 
         if i > 0:
-            accel_bias[i] = accel_bias[i-1] + np.random.normal(0, accel_bias_drift * np.sqrt(dt), 3)
-            gyro_bias[i] = gyro_bias[i-1] + np.random.normal(0, gyro_bias_drift * np.sqrt(dt), 3)
+            accel_bias[i] = accel_bias[i - 1] + np.random.normal(
+                0, accel_bias_drift * np.sqrt(dt), 3
+            )
+            gyro_bias[i] = gyro_bias[i - 1] + np.random.normal(
+                0, gyro_bias_drift * np.sqrt(dt), 3
+            )
 
     for i in range(1, N - 1):
-        v_prev = (gt_positions[i] - gt_positions[i-1]) / dt
-        v_next = (gt_positions[i+1] - gt_positions[i]) / dt
+        v_prev = (gt_positions[i] - gt_positions[i - 1]) / dt
+        v_next = (gt_positions[i + 1] - gt_positions[i]) / dt
         accel_world = (v_next - v_prev) / dt
         R = gt_rotations[i]
         accel_body = R.T @ (accel_world - gravity)
-        accel_meas[i] = accel_body + accel_bias[i] + np.random.normal(0, accel_noise_std, 3)
+        accel_meas[i] = (
+            accel_body + accel_bias[i] + np.random.normal(0, accel_noise_std, 3)
+        )
 
     for i in range(1, N):
-        R_prev = gt_rotations[i-1]
+        R_prev = gt_rotations[i - 1]
         R_curr = gt_rotations[i]
         dR = R_prev.T @ R_curr
         angle = np.arccos(np.clip((np.trace(dR) - 1) / 2, -1, 1))
         if angle > 1e-10:
-            axis = np.array([dR[2,1]-dR[1,2], dR[0,2]-dR[2,0], dR[1,0]-dR[0,1]])
+            axis = np.array(
+                [dR[2, 1] - dR[1, 2], dR[0, 2] - dR[2, 0], dR[1, 0] - dR[0, 1]]
+            )
             axis = axis / (2 * np.sin(angle))
             omega = axis * angle / dt
         else:

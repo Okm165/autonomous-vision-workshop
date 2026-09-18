@@ -23,12 +23,13 @@ References
 [3] Bouabdallah, "Design and Control of Quadrotors with Application to
     Autonomous Flying", EPFL PhD Thesis, 2007.
 """
+
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import numpy as np
 from numpy.typing import NDArray
-from typing import Tuple, Optional, Dict
-
 
 # ======================================================================
 #  Constants
@@ -36,14 +37,15 @@ from typing import Tuple, Optional, Dict
 
 GRAVITY = 9.81  # m/s²
 
-MAX_VELOCITY = 50.0        # m/s — clamp to prevent divergence
+MAX_VELOCITY = 50.0  # m/s — clamp to prevent divergence
 MAX_ANGULAR_VELOCITY = 100.0  # rad/s — clamp to prevent divergence
-INTEGRAL_CLAMP = 2.0       # integral error saturation limit
+INTEGRAL_CLAMP = 2.0  # integral error saturation limit
 
 
 # ======================================================================
 #  Quadrotor Parameters
 # ======================================================================
+
 
 class QuadrotorParams:
     r"""Physical parameters for a quadrotor UAV.
@@ -78,6 +80,18 @@ class QuadrotorParams:
         Maximum motor RPM
     """
 
+    mass: float
+    arm_length: float
+    I: NDArray[np.float64]  # noqa: E741 - established API name for inertia
+    I_inv: NDArray[np.float64]
+    k_f: float
+    k_tau: float
+    max_rpm: float
+    max_thrust_per_motor: float
+    mixer: NDArray[np.float64]
+    # np.linalg.inv widens the dtype to floating[Any]; float64 is not exact here.
+    mixer_inv: NDArray[np.floating]
+
     def __init__(
         self,
         mass: float = 0.5,
@@ -102,12 +116,14 @@ class QuadrotorParams:
         # Mixer matrix: maps [f1, f2, f3, f4] -> [F_total, tau_x, tau_y, tau_z]
         L = arm_length
         gamma = k_tau / k_f  # drag-to-thrust ratio
-        self.mixer = np.array([
-            [1.0,     1.0,    1.0,    1.0   ],
-            [0.0,     L,      0.0,   -L     ],
-            [-L,      0.0,    L,      0.0   ],
-            [gamma,  -gamma,  gamma, -gamma ],
-        ])
+        self.mixer = np.array(
+            [
+                [1.0, 1.0, 1.0, 1.0],
+                [0.0, L, 0.0, -L],
+                [-L, 0.0, L, 0.0],
+                [gamma, -gamma, gamma, -gamma],
+            ]
+        )
         self.mixer_inv = np.linalg.inv(self.mixer)
 
     @property
@@ -122,6 +138,7 @@ class QuadrotorParams:
 #  Quadrotor State
 # ======================================================================
 
+
 class QuadrotorState:
     r"""Full 12-DOF state of a rigid-body quadrotor.
 
@@ -133,6 +150,11 @@ class QuadrotorState:
     - :math:`\omega \in \mathbb{R}^3` — angular velocity in body frame
     """
 
+    position: NDArray[np.float64]
+    velocity: NDArray[np.float64]
+    rotation: NDArray[np.float64]
+    omega: NDArray[np.float64]
+
     def __init__(self) -> None:
         """Initialise the state to hover at the origin with zero velocity."""
         self.position = np.zeros(3)
@@ -140,7 +162,7 @@ class QuadrotorState:
         self.rotation = np.eye(3)
         self.omega = np.zeros(3)
 
-    def copy(self) -> "QuadrotorState":
+    def copy(self) -> QuadrotorState:
         """Return a deep copy of this state."""
         s = QuadrotorState()
         s.position = self.position.copy()
@@ -164,13 +186,12 @@ class QuadrotorState:
 
     def to_vector(self) -> NDArray[np.float64]:
         """Flatten to a 18-element vector [pos(3), vel(3), R_flat(9), omega(3)]."""
-        return np.concatenate([
-            self.position, self.velocity,
-            self.rotation.flatten(), self.omega
-        ])
+        return np.concatenate(
+            [self.position, self.velocity, self.rotation.flatten(), self.omega]
+        )
 
     @staticmethod
-    def from_vector(x: NDArray[np.float64]) -> "QuadrotorState":
+    def from_vector(x: NDArray[np.float64]) -> QuadrotorState:
         """Reconstruct a state from an 18-element vector.
 
         Parameters
@@ -187,11 +208,7 @@ class QuadrotorState:
 
 def hat(v: NDArray[np.float64]) -> NDArray[np.float64]:
     """Skew-symmetric (hat) map: R^3 -> so(3)."""
-    return np.array([
-        [0, -v[2], v[1]],
-        [v[2], 0, -v[0]],
-        [-v[1], v[0], 0]
-    ])
+    return np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
 
 
 def vee(M: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -203,12 +220,15 @@ def vee(M: NDArray[np.float64]) -> NDArray[np.float64]:
 #  Quadrotor Dynamics
 # ======================================================================
 
+
 def quadrotor_dynamics(
     state: QuadrotorState,
     thrusts: NDArray[np.float64],
     params: QuadrotorParams,
-    wind: Optional[NDArray[np.float64]] = None,
-) -> Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    wind: NDArray[np.float64] | None = None,
+) -> tuple[
+    NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]
+]:
     r"""Compute state derivatives from Newton-Euler equations.
 
     **Translational dynamics** (world frame):
@@ -273,7 +293,7 @@ def simulate_step(
     thrusts: NDArray[np.float64],
     params: QuadrotorParams,
     dt: float,
-    wind: Optional[NDArray[np.float64]] = None,
+    wind: NDArray[np.float64] | None = None,
     integrator: str = "rk4",
 ) -> QuadrotorState:
     r"""Advance state by one timestep using RK4 or Euler integration.
@@ -300,7 +320,7 @@ def simulate_step(
     thrusts = np.clip(thrusts, 0, params.max_thrust_per_motor)
 
     if integrator == "euler":
-        dp, dv, dR, dw = quadrotor_dynamics(state, thrusts, params, wind)
+        dp, dv, _dR, dw = quadrotor_dynamics(state, thrusts, params, wind)
         new = state.copy()
         new.position += dp * dt
         new.velocity += dv * dt
@@ -344,13 +364,18 @@ def _rk4_step(
     thrusts: NDArray[np.float64],
     params: QuadrotorParams,
     dt: float,
-    wind: Optional[NDArray[np.float64]],
+    wind: NDArray[np.float64] | None,
 ) -> QuadrotorState:
     """4th-order Runge-Kutta integrator."""
+
     def derivatives(
         s: QuadrotorState,
-    ) -> Tuple[NDArray[np.float64], NDArray[np.float64],
-               NDArray[np.float64], NDArray[np.float64]]:
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]:
         """Compute (dp, dv, omega, domega) for the RK4 sub-step."""
         dp, dv, _, dw = quadrotor_dynamics(s, thrusts, params, wind)
         return dp, dv, s.omega.copy(), dw
@@ -379,11 +404,11 @@ def _rk4_step(
     dp4, dv4, w4, dw4 = derivatives(s4)
 
     new = state.copy()
-    new.position += dt / 6 * (dp1 + 2*dp2 + 2*dp3 + dp4)
-    new.velocity += dt / 6 * (dv1 + 2*dv2 + 2*dv3 + dv4)
-    w_avg = (w1 + 2*w2 + 2*w3 + w4) / 6
+    new.position += dt / 6 * (dp1 + 2 * dp2 + 2 * dp3 + dp4)
+    new.velocity += dt / 6 * (dv1 + 2 * dv2 + 2 * dv3 + dv4)
+    w_avg = (w1 + 2 * w2 + 2 * w3 + w4) / 6
     new.rotation = state.rotation @ _exp_so3(dt * w_avg)
-    new.omega += dt / 6 * (dw1 + 2*dw2 + 2*dw3 + dw4)
+    new.omega += dt / 6 * (dw1 + 2 * dw2 + 2 * dw3 + dw4)
 
     return new
 
@@ -391,6 +416,7 @@ def _rk4_step(
 # ======================================================================
 #  Motor Mixing
 # ======================================================================
+
 
 def wrench_to_thrusts(
     F_total: float,
@@ -406,12 +432,16 @@ def wrench_to_thrusts(
     """
     wrench = np.array([F_total, torques[0], torques[1], torques[2]])
     thrusts = params.mixer_inv @ wrench
-    return np.clip(thrusts, 0, params.max_thrust_per_motor)
+    # np.clip widens to floating[Any]; the underlying arrays are float64.
+    return np.asarray(
+        np.clip(thrusts, 0, params.max_thrust_per_motor), dtype=np.float64
+    )
 
 
 # ======================================================================
 #  PID Controller
 # ======================================================================
+
 
 class PIDController:
     r"""Cascaded PID controller for quadrotor position tracking.
@@ -436,6 +466,14 @@ class PIDController:
 
     where :math:`\mathbf{z}_B = R \mathbf{e}_3` is the body z-axis.
     """
+
+    Kp: NDArray[np.float64]
+    Kd: NDArray[np.float64]
+    Ki: NDArray[np.float64]
+    Kp_att: NDArray[np.float64]
+    Kd_att: NDArray[np.float64]
+    max_tilt: float
+    int_error: NDArray[np.float64]
 
     def __init__(
         self,
@@ -476,8 +514,13 @@ class PIDController:
         self.int_error = np.clip(self.int_error, -INTEGRAL_CLAMP, INTEGRAL_CLAMP)
 
         # Desired acceleration (world frame)
-        a_des = (self.Kp * e_pos + self.Kd * e_vel + self.Ki * self.int_error
-                 + target_acc + np.array([0, 0, GRAVITY]))
+        a_des = (
+            self.Kp * e_pos
+            + self.Kd * e_vel
+            + self.Ki * self.int_error
+            + target_acc
+            + np.array([0, 0, GRAVITY])
+        )
 
         # --- Thrust magnitude ---
         z_body = state.rotation[:, 2]
@@ -521,6 +564,7 @@ class PIDController:
 #  SE(3) Geometric Controller (Lee et al. 2010)
 # ======================================================================
 
+
 class SE3Controller:
     r"""Geometric tracking controller on SE(3).
 
@@ -542,6 +586,11 @@ class SE3Controller:
 
     This controller has almost-global asymptotic stability on SO(3).
     """
+
+    kx: float
+    kv: float
+    kR: float
+    kw: float
 
     def __init__(
         self,
@@ -575,8 +624,7 @@ class SE3Controller:
         e_v = state.velocity - target_vel
 
         # Desired force vector (world frame)
-        F_des = (-self.kx * e_p - self.kv * e_v
-                 + m * GRAVITY * e3 + m * target_acc)
+        F_des = -self.kx * e_p - self.kv * e_v + m * GRAVITY * e3 + m * target_acc
 
         # Desired body z-axis
         z_des = F_des / (np.linalg.norm(F_des) + 1e-8)
@@ -601,9 +649,12 @@ class SE3Controller:
         e_omega = state.omega  # desired omega ≈ 0
 
         # Torque (Lee et al. Eq. 12)
-        I = params.I
-        tau = (-self.kR * e_R - self.kw * e_omega
-               + np.cross(state.omega, I @ state.omega))
+        inertia = params.I
+        tau = (
+            -self.kR * e_R
+            - self.kw * e_omega
+            + np.cross(state.omega, inertia @ state.omega)
+        )
 
         return wrench_to_thrusts(F_total, tau, params)
 
@@ -612,11 +663,12 @@ class SE3Controller:
 #  Trajectory Generation (Minimum Snap)
 # ======================================================================
 
+
 def generate_hover_trajectory(
     center: NDArray[np.float64],
     duration: float,
     dt: float,
-) -> Dict[str, NDArray[np.float64]]:
+) -> dict[str, np.ndarray]:
     """Generate a stationary hover trajectory."""
     N = int(duration / dt)
     t = np.arange(N) * dt
@@ -636,7 +688,7 @@ def generate_circle_trajectory(
     period: float,
     duration: float,
     dt: float,
-) -> Dict[str, NDArray[np.float64]]:
+) -> dict[str, np.ndarray]:
     r"""Generate a circular trajectory with analytic derivatives.
 
     .. math::
@@ -675,7 +727,7 @@ def generate_figure8_trajectory(
     period: float,
     duration: float,
     dt: float,
-) -> Dict[str, NDArray[np.float64]]:
+) -> dict[str, np.ndarray]:
     r"""Lissajous figure-8 trajectory.
 
     .. math::
@@ -711,7 +763,7 @@ def generate_waypoint_trajectory(
     waypoints: NDArray[np.float64],
     speed: float,
     dt: float,
-) -> Dict[str, NDArray[np.float64]]:
+) -> dict[str, NDArray[np.float64]]:
     """Generate a piecewise-linear trajectory through waypoints.
 
     Parameters
@@ -728,7 +780,7 @@ def generate_waypoint_trajectory(
     times = []
 
     t_current = 0.0
-    for i, (seg, length) in enumerate(zip(segments, lengths)):
+    for i, (seg, length) in enumerate(zip(segments, lengths, strict=False)):
         seg_time = length / speed
         direction = seg / (length + 1e-12)
         n_steps = max(1, int(seg_time / dt))
@@ -760,14 +812,20 @@ def generate_waypoint_trajectory(
 #  Simulation Utilities
 # ======================================================================
 
+
 def simulate_trajectory(
-    trajectory: Dict[str, NDArray[np.float64]],
-    controller,
+    trajectory: dict[str, NDArray[np.float64]],
+    controller: SE3Controller | PIDController | Callable[..., NDArray[np.float64]],
     params: QuadrotorParams,
     dt: float = 0.005,
     wind_func=None,
-) -> Dict[str, NDArray[np.float64]]:
+) -> dict[str, NDArray[np.float64]]:
     r"""Run closed-loop simulation of a quadrotor tracking a trajectory.
+
+    ``controller`` may be the geometric :class:`SE3Controller`, the cascaded
+    :class:`PIDController` (which adds the previous timestep's ``dt``), or any
+    callable with the seven-argument ``(state, pos, vel, acc, yaw, params,
+    dt)`` signature.
 
     Returns dictionary with time, actual positions, errors, thrusts.
     """
@@ -799,18 +857,24 @@ def simulate_trajectory(
 
         wind = wind_func(traj_t[i]) if wind_func else None
 
-        if hasattr(controller, 'compute'):
-            if isinstance(controller, SE3Controller):
-                thrusts = controller.compute(
-                    state, traj_pos[i], traj_vel[i], traj_acc[i],
-                    traj_yaw[i], params)
-            else:
-                thrusts = controller.compute(
-                    state, traj_pos[i], traj_vel[i], traj_acc[i],
-                    traj_yaw[i], params, dt)
+        if isinstance(controller, SE3Controller):
+            thrusts = controller.compute(
+                state, traj_pos[i], traj_vel[i], traj_acc[i], traj_yaw[i], params
+            )
+        elif isinstance(controller, PIDController):
+            thrusts = controller.compute(
+                state,
+                traj_pos[i],
+                traj_vel[i],
+                traj_acc[i],
+                traj_yaw[i],
+                params,
+                dt,
+            )
         else:
-            thrusts = controller(state, traj_pos[i], traj_vel[i],
-                                 traj_acc[i], traj_yaw[i], params, dt)
+            thrusts = controller(
+                state, traj_pos[i], traj_vel[i], traj_acc[i], traj_yaw[i], params, dt
+            )
 
         thrust_log[i] = thrusts
         state = simulate_step(state, thrusts, params, dt, wind, integrator="rk4")

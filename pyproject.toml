@@ -17,6 +17,7 @@ dependencies = [
     "open3d>=0.17",
     "numba>=0.58",
     "Pillow>=10.0",
+    "tornado>=6.4,<6.5",
 ]
 
 [project.optional-dependencies]
@@ -37,4 +38,89 @@ packages = ["src"]
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    # The editors (Zed `.zed/settings.json`) and every command in README.md
+    # resolve these from the project's own `.venv`, so `basedpyright` and
+    # `ruff` must be installed here rather than assumed to be on `$PATH`.
+    "basedpyright>=1.40",
+    "ruff>=0.16",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.basedpyright]
+include = ["src", "tests", "notebooks"]
+exclude = ["**/__pycache__", ".venv", ".uv-cache", "data"]
+typeCheckingMode = "standard"
+pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
+# Local partial stubs that correct upstream packages shipping incomplete or
+# wrong inline types (see typings/README.md).  Using stubPath keeps the fix
+# honest: we state the real contract instead of muting the diagnostic.
+stubPath = "typings"
+# Treat our own modules strictly, but tolerate the untyped third-party
+# scientific stack (NumPy/SciPy/OpenCV/open3d) whose stubs are incomplete.
+reportMissingTypeStubs = "none"
+reportMissingModuleSource = "none"
+# Third-party (NumPy/SciPy/matplotlib) expressions routinely evaluate to
+# partially-unknown types.  We annotate every boundary we own, so these are
+# reported only for our own code below.
+reportAny = "none"
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownParameterType = "none"
+reportUnannotatedClassAttribute = "warning"
+reportMissingTypeArgument = "error"
+reportConstantRedefinition = "none"
+reportPrivateUsage = "none"
+reportUnusedCallResult = "none"
+reportUnnecessaryIsInstance = "none"
+reportUnnecessaryComparison = "error"
+
+# mpl_toolkits.mplot3d ships no `py.typed` marker, so type checkers analyse its
+# source and narrow parameters like `zs=0` / `s=20` to `int` even though the
+# documented contract is `float or array-like`.  `typings/mpl_toolkits` declares
+# the real contract (see typings/README.md) rather than muting the diagnostic.
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+# Notebook cells are linted but not auto-formatted: reformatting rewrites every
+# cell as one implicit module, which reflows teaching code and produces huge,
+# review-hostile diffs.  Notebooks stay hand-formatted (and ruff-clean).
+format.exclude = ["notebooks/**"]
+
+[tool.ruff.lint]
+# Curated selection: correctness + modernization + simplification that does not
+# fight this project's math/notebook conventions.
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort (import order)
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+    "PT",  # flake8-pytest-style
+]
+ignore = [
+    "N802", # math naming convention: K, R, T, F as function names
+    "N803", # math naming convention: K, R, T, F as arguments
+    "N806", # math naming convention: K, R, T as locals
+    "N815", # math naming convention: mixedCase in class scope
+    "RUF001", # unicode math typography: \u00d7, \u2212, \u2248 are intentional
+    "RUF002", # (same, docstrings)
+    "RUF003", # (same, comments)
+    "E501", # ruff format owns code line length; long URLs/comments are unfixable
+    "B008", # numpy idiom: np.eye(3) / np.zeros(n) as default arguments
+    "SIM300", # yoda conditions: `R > threshold` reads better than `threshold < R`
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Sequential notebook cells routinely import mid-cell (after setup/loaded state).
+"notebooks/*.ipynb" = ["E402"]

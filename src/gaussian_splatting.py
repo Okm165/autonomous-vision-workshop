@@ -18,8 +18,9 @@ Rendering pipeline:
 
 from __future__ import annotations
 
-import numpy as np
 from dataclasses import dataclass
+
+import numpy as np
 from numpy.typing import NDArray
 
 try:
@@ -41,11 +42,13 @@ except ImportError:
             q = np.asarray(q, dtype=np.float64).ravel()
             q = q / (np.linalg.norm(q) + 1e-12)
             w, x, y, z = q
-            return np.array([
-                [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
-                [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-                [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
-            ])
+            return np.array(
+                [
+                    [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                    [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                    [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+                ]
+            )
 
 
 _TRANSMITTANCE_EPS = 1e-4
@@ -65,11 +68,11 @@ class Gaussian3D:
     This ensures Σ is always positive semi-definite.
     """
 
-    position: np.ndarray       # (3,) center μ
-    scale: np.ndarray          # (3,) log-scale factors
-    quaternion: np.ndarray     # (4,) rotation quaternion [w,x,y,z]
-    color: np.ndarray          # (3,) RGB color
-    opacity: float             # α ∈ [0,1]
+    position: np.ndarray  # (3,) center μ
+    scale: np.ndarray  # (3,) log-scale factors
+    quaternion: np.ndarray  # (4,) rotation quaternion [w,x,y,z]
+    color: np.ndarray  # (3,) RGB color
+    opacity: float  # α ∈ [0,1]
 
     @property
     def scales(self) -> np.ndarray:
@@ -180,10 +183,12 @@ def project_gaussian_to_2d(
     fx, fy = K[0, 0], K[1, 1]
     x, y, z = mu_cam
 
-    J = np.array([
-        [fx / z, 0.0, -fx * x / (z * z)],
-        [0.0, fy / z, -fy * y / (z * z)],
-    ])
+    J = np.array(
+        [
+            [fx / z, 0.0, -fx * x / (z * z)],
+            [0.0, fy / z, -fy * y / (z * z)],
+        ]
+    )
 
     Sigma_world = gaussian.covariance_3d
     Sigma_cam = R_cam @ Sigma_world @ R_cam.T
@@ -200,11 +205,11 @@ def project_gaussian_to_2d(
 
 
 def gaussian_2d_pdf(
-    x: NDArray[np.float64],
-    y: NDArray[np.float64],
+    x: float | NDArray[np.float64],
+    y: float | NDArray[np.float64],
     mu: NDArray[np.float64],
     cov: NDArray[np.float64],
-) -> NDArray[np.float64]:
+) -> NDArray[np.float64] | np.float64:
     r"""
     Evaluate 2D Gaussian PDF on a grid.
 
@@ -223,8 +228,9 @@ def gaussian_2d_pdf(
 
     Parameters
     ----------
-    x, y : ndarray
-        Coordinate grids (same shape, e.g. from np.meshgrid).
+    x, y : float | ndarray
+        Coordinate grids (same shape, e.g. from np.meshgrid); scalars
+        evaluate the PDF at a single point.
     mu : ndarray, shape (2,)
         Mean [μx, μy].
     cov : ndarray, shape (2, 2)
@@ -297,7 +303,15 @@ def render_gaussians(
     image = np.zeros((H, W, 3), dtype=np.float64)
     transmittance = np.ones((H, W), dtype=np.float64)
 
-    projected: list[tuple[NDArray, NDArray, float, NDArray, float]] = []
+    projected: list[
+        tuple[
+            NDArray[np.float64],
+            NDArray[np.float64],
+            float,
+            NDArray[np.floating],
+            float,
+        ]
+    ] = []
     for g in gaussians:
         mu_2d, cov_2d, depth = project_gaussian_to_2d(g, T_world_to_cam, K)
         if depth < 0.1:
@@ -337,7 +351,7 @@ def render_gaussians(
         for ch in range(3):
             image[y_min:y_max, x_min:x_max, ch] += weight * color[ch]
 
-        transmittance[y_min:y_max, x_min:x_max] *= (1.0 - alpha_map)
+        transmittance[y_min:y_max, x_min:x_max] *= 1.0 - alpha_map
 
         if transmittance.max() < _TRANSMITTANCE_EPS:
             break
@@ -396,9 +410,8 @@ def _gaussian_kernel_1d(size: int, sigma: float) -> NDArray[np.float64]:
 def _apply_gaussian_filter(
     img: NDArray[np.float64], kernel_size: int = 11, sigma: float = 1.5
 ) -> NDArray[np.float64]:
-    """Apply separable Gaussian filter (valid-mode convolution)."""
+    """Apply separable Gaussian filter (same-mode convolution)."""
     k1d = _gaussian_kernel_1d(kernel_size, sigma)
-    pad = kernel_size // 2
 
     if img.ndim == 2:
         img = img[:, :, np.newaxis]
@@ -433,8 +446,8 @@ def _compute_ssim(
 
     Returns the mean SSIM over all pixels and channels.
     """
-    C1 = 0.01 ** 2
-    C2 = 0.03 ** 2
+    C1 = 0.01**2
+    C2 = 0.03**2
 
     mu1 = _apply_gaussian_filter(img1, kernel_size, sigma)
     mu2 = _apply_gaussian_filter(img2, kernel_size, sigma)
@@ -456,7 +469,9 @@ def _compute_ssim(
 
 
 def create_random_gaussians(
-    n: int, bounds: tuple[float, float] = (-1.0, 1.0)
+    n: int,
+    bounds: tuple[float, float] = (-1.0, 1.0),
+    rng: np.random.Generator | None = None,
 ) -> list[Gaussian3D]:
     """
     Create N random Gaussians within given spatial bounds for testing.
@@ -467,30 +482,36 @@ def create_random_gaussians(
         Number of Gaussians.
     bounds : tuple (lo, hi)
         Spatial extent for positions.
+    rng : np.random.Generator, optional
+        Random generator for reproducibility. ``None`` → global RNG state.
 
     Returns
     -------
     list of Gaussian3D
     """
+    if rng is None:
+        rng = np.random.default_rng()
     lo, hi = bounds
     gaussians: list[Gaussian3D] = []
     for _ in range(n):
-        pos = np.random.uniform(lo, hi, size=3)
-        scale = np.random.uniform(-2.0, 0.0, size=3)
+        pos = rng.uniform(lo, hi, size=3)
+        scale = rng.uniform(-2.0, 0.0, size=3)
 
-        q = np.random.randn(4)
+        q = rng.normal(size=4)
         q = q / (np.linalg.norm(q) + 1e-12)
 
-        color = np.random.uniform(0.0, 1.0, size=3)
-        opacity = float(np.random.uniform(0.3, 1.0))
+        color = rng.uniform(0.0, 1.0, size=3)
+        opacity = float(rng.uniform(0.3, 1.0))
 
-        gaussians.append(Gaussian3D(
-            position=pos,
-            scale=scale,
-            quaternion=q,
-            color=color,
-            opacity=opacity,
-        ))
+        gaussians.append(
+            Gaussian3D(
+                position=pos,
+                scale=scale,
+                quaternion=q,
+                color=color,
+                opacity=opacity,
+            )
+        )
     return gaussians
 
 

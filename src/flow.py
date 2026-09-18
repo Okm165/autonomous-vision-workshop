@@ -36,15 +36,15 @@ References
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
-
 import cv2
 import numpy as np
 
+from . import _cv
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _ensure_gray_float(img: np.ndarray) -> np.ndarray:
     """Convert *img* to ``float64`` grayscale in [0, 1]."""
@@ -57,7 +57,7 @@ def _ensure_gray_float(img: np.ndarray) -> np.ndarray:
 
 def _image_gradients(
     img: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     r"""Central-difference spatial gradients.
 
     .. math::
@@ -73,9 +73,7 @@ def _image_gradients(
     return Ix, Iy
 
 
-def _build_gaussian_pyramid(
-    img: np.ndarray, levels: int
-) -> list[np.ndarray]:
+def _build_gaussian_pyramid(img: np.ndarray, levels: int) -> list[np.ndarray]:
     """Build a Gaussian pyramid with *levels* entries (index 0 = original)."""
     pyramid: list[np.ndarray] = [img]
     for _ in range(1, levels):
@@ -90,8 +88,12 @@ def _build_gaussian_pyramid(
 
 
 def _compute_gradient_windows(
-    Ix: np.ndarray, Iy: np.ndarray, ix: int, iy: int, half: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+    Ix: np.ndarray,
+    Iy: np.ndarray,
+    ix: int,
+    iy: int,
+    half: int,
+) -> tuple[np.ndarray, np.ndarray]:
     """Extract gradient sub-windows centred on pixel (ix, iy)."""
     Ix_w = Ix[iy - half : iy + half + 1, ix - half : ix + half + 1]
     Iy_w = Iy[iy - half : iy + half + 1, ix - half : ix + half + 1]
@@ -99,14 +101,14 @@ def _compute_gradient_windows(
 
 
 def _build_structure_tensor(
-    Ix_w: np.ndarray, Iy_w: np.ndarray,
+    Ix_w: np.ndarray,
+    Iy_w: np.ndarray,
 ) -> np.ndarray:
     """Build the 2x2 structure tensor (Harris matrix) from gradient windows."""
     sum_IxIx = np.sum(Ix_w * Ix_w)
     sum_IxIy = np.sum(Ix_w * Iy_w)
     sum_IyIy = np.sum(Iy_w * Iy_w)
-    return np.array([[sum_IxIx, sum_IxIy],
-                     [sum_IxIy, sum_IyIy]], dtype=np.float64)
+    return np.array([[sum_IxIx, sum_IxIy], [sum_IxIy, sum_IyIy]], dtype=np.float64)
 
 
 def _lk_iterative_refine(
@@ -120,30 +122,33 @@ def _lk_iterative_refine(
     half: int,
     max_iterations: int,
     epsilon: float,
-) -> Tuple[float, float, bool]:
-    """Run iterative refinement for one tracked point, returning (dx, dy, ok)."""
+    initial: tuple[float, float] = (0.0, 0.0),
+) -> tuple[float, float, bool]:
+    """Run iterative refinement for one tracked point, returning (dx, dy, ok).
+
+    *initial* is the starting displacement guess.  ``_track_single_point``
+    leaves it at zero, while the pyramidal tracker seeds each level with the
+    up-scaled estimate from the level above so that the returned displacement
+    is the residual on top of that prediction rather than the full flow.
+    """
     H, W = prev.shape
-    ix, iy = int(round(px)), int(round(py))
-    dx_total, dy_total = 0.0, 0.0
+    ix, iy = round(px), round(py)
+    dx_total, dy_total = float(initial[0]), float(initial[1])
     ok = True
     for _ in range(max_iterations):
         cx = px + dx_total
         cy = py + dy_total
-        cix, ciy = int(round(cx)), int(round(cy))
+        cix, ciy = round(cx), round(cy)
 
-        if (cix - half < 0 or cix + half >= W
-                or ciy - half < 0 or ciy + half >= H):
+        if cix - half < 0 or cix + half >= W or ciy - half < 0 or ciy + half >= H:
             ok = False
             break
 
-        curr_patch = curr[ciy - half : ciy + half + 1,
-                          cix - half : cix + half + 1]
-        prev_patch = prev[iy - half : iy + half + 1,
-                          ix - half : ix + half + 1]
+        curr_patch = curr[ciy - half : ciy + half + 1, cix - half : cix + half + 1]
+        prev_patch = prev[iy - half : iy + half + 1, ix - half : ix + half + 1]
         It = curr_patch - prev_patch
 
-        b = np.array([-np.sum(Ix_w * It),
-                      -np.sum(Iy_w * It)], dtype=np.float64)
+        b = np.array([-np.sum(Ix_w * It), -np.sum(Iy_w * It)], dtype=np.float64)
 
         dd = ATA_inv @ b
         dx_total += dd[0]
@@ -168,9 +173,14 @@ def _track_single_point(
     min_eigenvalue: float,
     max_iterations: int,
     epsilon: float,
-) -> Tuple[np.ndarray, bool]:
-    """Track one point from *prev* to *curr* via Lucas-Kanade, returning (new_xy, ok)."""
-    ix, iy = int(round(px)), int(round(py))
+    initial: tuple[float, float] = (0.0, 0.0),
+) -> tuple[np.ndarray, bool]:
+    """Track one point from *prev* to *curr* via Lucas-Kanade, returning (new_xy, ok).
+
+    *initial* is an optional starting displacement guess, used by the
+    pyramidal tracker to consume the estimate from the coarser level.
+    """
+    ix, iy = round(px), round(py)
 
     if ix - half < 0 or ix + half >= W or iy - half < 0 or iy + half >= H:
         return np.array([px, py]), False
@@ -185,8 +195,17 @@ def _track_single_point(
     ATA_inv = np.linalg.inv(ATA)
 
     dx_total, dy_total, ok = _lk_iterative_refine(
-        prev, curr, Ix_w, Iy_w, ATA_inv,
-        px, py, half, max_iterations, epsilon,
+        prev,
+        curr,
+        Ix_w,
+        Iy_w,
+        ATA_inv,
+        px,
+        py,
+        half,
+        max_iterations,
+        epsilon,
+        initial,
     )
 
     new_xy = np.array([px + dx_total, py + dy_total])
@@ -204,7 +223,8 @@ def lucas_kanade(
     min_eigenvalue: float = 1e-4,
     max_iterations: int = 10,
     epsilon: float = 0.03,
-) -> Tuple[np.ndarray, np.ndarray]:
+    initial: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     r"""Lucas–Kanade optical flow for sparse points.
 
     **Brightness-constancy assumption**
@@ -280,6 +300,10 @@ def lucas_kanade(
         falls below this value (poorly conditioned).
     max_iterations : Newton-style refinement iterations per point.
     epsilon : Convergence threshold on the displacement update norm.
+    initial : (N, 2) optional starting displacement guess per point.  The
+        refinement then searches for the *residual* displacement around that
+        prediction instead of starting from zero, which is what the pyramidal
+        tracker needs to consume its coarser-level estimate.
 
     Returns
     -------
@@ -292,6 +316,16 @@ def lucas_kanade(
     if points.ndim == 1:
         points = points.reshape(1, 2)
 
+    if initial is None:
+        initial = np.zeros_like(points)
+    else:
+        initial = np.asarray(initial, dtype=np.float64).reshape(-1, 2)
+        if initial.shape != points.shape:
+            raise ValueError(
+                f"initial must have the same shape as points; "
+                f"got {initial.shape} and {points.shape}"
+            )
+
     H, W = prev.shape
     half = window_size // 2
     Ix, Iy = _image_gradients(prev)
@@ -302,10 +336,19 @@ def lucas_kanade(
 
     for i in range(N):
         new_points[i], status[i] = _track_single_point(
-            prev, curr, Ix, Iy,
-            points[i, 0], points[i, 1],
-            half, H, W,
-            min_eigenvalue, max_iterations, epsilon,
+            prev,
+            curr,
+            Ix,
+            Iy,
+            points[i, 0],
+            points[i, 1],
+            half,
+            H,
+            W,
+            min_eigenvalue,
+            max_iterations,
+            epsilon,
+            (float(initial[i, 0]), float(initial[i, 1])),
         )
 
     return new_points, status
@@ -315,6 +358,7 @@ def lucas_kanade(
 # 2. Pyramidal Lucas–Kanade
 # ---------------------------------------------------------------------------
 
+
 def pyramidal_lk(
     prev: np.ndarray,
     curr: np.ndarray,
@@ -323,7 +367,7 @@ def pyramidal_lk(
     window_size: int = 15,
     max_iterations: int = 10,
     epsilon: float = 0.03,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     r"""Pyramidal Lucas–Kanade for handling large displacements.
 
     Plain LK cannot cope with motions larger than about half the window
@@ -373,45 +417,72 @@ def pyramidal_lk(
     curr = _ensure_gray_float(curr)
     points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
 
+    if levels < 1:
+        raise ValueError(f"levels must be >= 1, got {levels}")
+
+    half = window_size // 2
+    min_side = 2 * half + 1
+    # The coarsest level must be able to host a window centred on an interior
+    # pixel *and* shift it by the predicted flow, so require some headroom
+    # beyond the bare window size; otherwise every query there fails and the
+    # result is silently empty.
+    need_side = min_side + 4
+    coarsest = min(prev.shape) / (2.0 ** (levels - 1))
+    if coarsest < need_side:
+        raise ValueError(
+            f"levels={levels} makes the coarsest pyramid level "
+            f"({coarsest:.1f} px) too small for the tracking window "
+            f"({min_side} px) plus search headroom; reduce levels or "
+            f"window_size"
+        )
+
     pyr_prev = _build_gaussian_pyramid(prev, levels)
     pyr_curr = _build_gaussian_pyramid(curr, levels)
 
     N = len(points)
-    # Scale points to the coarsest level
-    scale = 2.0 ** (levels - 1)
-    scaled_pts = points / scale
-
-    cumulative_flow = np.zeros((N, 2), dtype=np.float64)
     status = np.ones(N, dtype=bool)
 
-    for lvl in range(levels - 1, -1, -1):
-        guess_pts = scaled_pts + cumulative_flow
+    # Bouguet coarse-to-fine tracking.
+    #
+    # ``points`` are in level-0 (full-resolution) coordinates.  We start at
+    # the coarsest level, where the same window spans 2^L times as much image
+    # motion, and carry the estimate down with ``d^L = 2 d^(L+1) + delta^L``.
+    # The prediction is fed in as the *starting displacement* of each level's
+    # refinement (via the ``initial`` argument), so the measured residual is
+    # the correction to the coarse estimate rather than a fresh measurement of
+    # the whole flow — that is what keeps the recursion from double-counting.
+    scale = 2.0 ** (levels - 1)
+    level_points = points / scale
+    flow = np.zeros((N, 2), dtype=np.float64)
 
+    for lvl in range(levels - 1, -1, -1):
         lvl_new, lvl_status = lucas_kanade(
             pyr_prev[lvl],
             pyr_curr[lvl],
-            guess_pts,
+            level_points,
             window_size=window_size,
             max_iterations=max_iterations,
             epsilon=epsilon,
+            initial=flow,
         )
 
-        residual = lvl_new - guess_pts
-        cumulative_flow += residual
+        # Total displacement at this level = coarse prediction + residual.
+        flow = lvl_new - level_points
         status &= lvl_status
 
         if lvl > 0:
-            # Move to the next finer level: double coords and flow
-            scaled_pts *= 2.0
-            cumulative_flow *= 2.0
+            # Move to the next finer level: coordinates and flow double.
+            level_points *= 2.0
+            flow *= 2.0
 
-    new_points = scaled_pts + cumulative_flow
+    new_points = level_points + flow
     return new_points, status
 
 
 # ---------------------------------------------------------------------------
 # 3. Dense optical flow — Farnebäck wrapper
 # ---------------------------------------------------------------------------
+
 
 def dense_flow_farneback(
     prev: np.ndarray,
@@ -472,10 +543,9 @@ def dense_flow_farneback(
     prev_u8 = (prev_g * 255).clip(0, 255).astype(np.uint8)
     curr_u8 = (curr_g * 255).clip(0, 255).astype(np.uint8)
 
-    flow = cv2.calcOpticalFlowFarneback(
+    flow = _cv.farneback_flow(
         prev_u8,
         curr_u8,
-        flow=None,
         pyr_scale=pyr_scale,
         levels=levels,
         winsize=winsize,
@@ -491,9 +561,10 @@ def dense_flow_farneback(
 # 4. Flow visualisation (Middlebury colour convention)
 # ---------------------------------------------------------------------------
 
+
 def flow_to_color(
     flow: np.ndarray,
-    max_flow: Optional[float] = None,
+    max_flow: float | None = None,
 ) -> np.ndarray:
     r"""Convert a dense optical-flow field to an HSV colour image.
 
@@ -532,7 +603,7 @@ def flow_to_color(
     dx = flow[..., 0]
     dy = flow[..., 1]
 
-    magnitude = np.sqrt(dx ** 2 + dy ** 2)
+    magnitude = np.sqrt(dx**2 + dy**2)
     angle = np.arctan2(dy, dx)  # radians in [-π, π]
 
     if max_flow is None:
@@ -540,11 +611,10 @@ def flow_to_color(
 
     hsv = np.zeros((*flow.shape[:2], 3), dtype=np.uint8)
     # OpenCV HSV: H in [0,180), S and V in [0,255]
-    hsv[..., 0] = ((angle + np.pi) / (2 * np.pi) * 180).astype(np.uint8)
+    # hue = atan2(dy, dx) taken modulo 2π (Middlebury: +x flow → red)
+    hsv[..., 0] = (np.mod(angle, 2.0 * np.pi) / (2.0 * np.pi) * 180).astype(np.uint8)
     hsv[..., 1] = 255
-    hsv[..., 2] = (np.clip(magnitude / max_flow, 0.0, 1.0) * 255).astype(
-        np.uint8
-    )
+    hsv[..., 2] = (np.clip(magnitude / max_flow, 0.0, 1.0) * 255).astype(np.uint8)
 
     rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     return rgb
@@ -556,11 +626,11 @@ def flow_to_color(
 
 
 def _build_homogeneous_pixel_grid(
-    H: int, W: int,
+    H: int,
+    W: int,
 ) -> np.ndarray:
     """Construct an (H, W, 3) grid of homogeneous pixel coordinates."""
-    us, vs = np.meshgrid(np.arange(W, dtype=np.float64),
-                         np.arange(H, dtype=np.float64))
+    us, vs = np.meshgrid(np.arange(W, dtype=np.float64), np.arange(H, dtype=np.float64))
     return np.stack([us, vs, np.ones_like(us)], axis=-1)
 
 
@@ -569,7 +639,7 @@ def _compute_rotation_only_flow(
     K_inv: np.ndarray,
     R: np.ndarray,
     uv1: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Rotation-only projected positions and flow (depth-independent).
 
     Returns (flow_rot, rotated_rays) where *rotated_rays* = R K^{-1} u
@@ -608,10 +678,9 @@ def _recover_depth_from_flow_decomposition(
 ) -> np.ndarray:
     """Solve Z = ||f_trans(Z=1)|| / ||f_observed - f_rot||."""
     residual = flow[..., :2] - flow_rot
-    mag_residual = np.sqrt(np.sum(residual ** 2, axis=-1)).clip(min=1e-12)
-    mag_trans_unit = np.sqrt(np.sum(flow_trans_unit ** 2, axis=-1))
-    return np.where(mag_trans_unit > min_flow_mag,
-                    mag_trans_unit / mag_residual, 0.0)
+    mag_residual = np.sqrt(np.sum(residual**2, axis=-1)).clip(min=1e-12)
+    mag_trans_unit = np.sqrt(np.sum(flow_trans_unit**2, axis=-1))
+    return np.where(mag_trans_unit > min_flow_mag, mag_trans_unit / mag_residual, 0.0)
 
 
 def flow_to_depth(
@@ -685,13 +754,17 @@ def flow_to_depth(
     flow_trans_unit = _compute_unit_translation_flow(K, rotated, t, flow_rot, uv1)
 
     return _recover_depth_from_flow_decomposition(
-        flow, flow_rot, flow_trans_unit, min_flow_mag,
+        flow,
+        flow_rot,
+        flow_trans_unit,
+        min_flow_mag,
     )
 
 
 # ---------------------------------------------------------------------------
 # 6. 3-D scene flow
 # ---------------------------------------------------------------------------
+
 
 def _backproject(
     depth: np.ndarray,
@@ -706,8 +779,7 @@ def _backproject(
     H, W = depth.shape[:2]
     K_inv = np.linalg.inv(K)
 
-    us, vs = np.meshgrid(np.arange(W, dtype=np.float64),
-                         np.arange(H, dtype=np.float64))
+    us, vs = np.meshgrid(np.arange(W, dtype=np.float64), np.arange(H, dtype=np.float64))
     ones = np.ones_like(us)
     uv1 = np.stack([us, vs, ones], axis=-1)  # (H, W, 3)
 
@@ -720,7 +792,7 @@ def compute_scene_flow(
     depth1: np.ndarray,
     depth2: np.ndarray,
     K: np.ndarray,
-    T_12: Optional[np.ndarray] = None,
+    T_12: np.ndarray | None = None,
 ) -> np.ndarray:
     r"""Compute 3-D scene flow from 2-D optical flow and paired depth maps.
 
@@ -783,8 +855,7 @@ def compute_scene_flow(
     P1 = _backproject(depth1, K)  # (H, W, 3)
 
     # Step 2 — warped pixel coordinates in frame 2
-    us, vs = np.meshgrid(np.arange(W, dtype=np.float64),
-                         np.arange(H, dtype=np.float64))
+    us, vs = np.meshgrid(np.arange(W, dtype=np.float64), np.arange(H, dtype=np.float64))
     u2 = us + flow_2d[..., 0]
     v2 = vs + flow_2d[..., 1]
 
@@ -822,6 +893,7 @@ def compute_scene_flow(
 # ---------------------------------------------------------------------------
 # 7. Flow warping (bilinear backward warp)
 # ---------------------------------------------------------------------------
+
 
 def warp_image_flow(
     image: np.ndarray,
@@ -874,6 +946,7 @@ def warp_image_flow(
 #  RAFT wrapper (GPU optional)
 # ======================================================================
 
+
 def neural_flow_raft(
     prev: np.ndarray,
     curr: np.ndarray,
@@ -899,12 +972,17 @@ def neural_flow_raft(
     flow : (H, W, 2) optical flow field
     """
     try:
-        import torch
-        import torchvision.models.optical_flow as tof
-        from torchvision.transforms.functional import to_tensor
+        import torch  # pyright: ignore[reportMissingImports]
+        import torchvision.models.optical_flow as tof  # pyright: ignore[reportMissingImports]
+        from torchvision.transforms.functional import (  # pyright: ignore[reportMissingImports]
+            to_tensor,
+        )
     except ImportError:
         import warnings
-        warnings.warn("torch/torchvision not available — falling back to Farneback.")
+
+        warnings.warn(
+            "torch/torchvision not available — falling back to Farneback.", stacklevel=2
+        )
         return dense_flow_farneback(prev, curr)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
