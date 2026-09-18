@@ -8,3 +8,22 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Tool caches (regenerated automatically)
+.pytest_cache/
+.ruff_cache/
+.uv-cache/
+
+# Datasets (regenerable via data/download.sh; several hundred MB)
+data/kitti/
+data/tum/
+
+# Downloaded Middlebury ground truth (regenerable via data/download.sh);
+# keep the image pairs themselves.
+data/sample_pairs/middlebury/*_disp0.pfm
+data/sample_pairs/middlebury/*_calib.txt
+
+.zed/
