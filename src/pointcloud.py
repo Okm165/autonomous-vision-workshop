@@ -7,13 +7,15 @@ voxel downsampling, normal estimation, and outlier removal.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 from scipy.spatial import KDTree
-
 
 # ---------------------------------------------------------------------------
 # 1. Depth → point cloud
 # ---------------------------------------------------------------------------
+
 
 def depth_to_pointcloud(
     depth: np.ndarray,
@@ -73,6 +75,7 @@ def depth_to_pointcloud(
 # 2. SE(3) transform
 # ---------------------------------------------------------------------------
 
+
 def transform_points(points: np.ndarray, T: np.ndarray) -> np.ndarray:
     """Apply an SE(3) transformation to a point cloud.
 
@@ -94,7 +97,7 @@ def transform_points(points: np.ndarray, T: np.ndarray) -> np.ndarray:
     """
     xyz = points[:, :3]
     ones = np.ones((xyz.shape[0], 1), dtype=xyz.dtype)
-    hom = np.concatenate([xyz, ones], axis=1)          # (N, 4)
+    hom = np.concatenate([xyz, ones], axis=1)  # (N, 4)
     xyz_t = (hom @ T.T)[:, :3]
 
     if points.shape[1] > 3:
@@ -105,6 +108,7 @@ def transform_points(points: np.ndarray, T: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # 3. Merge multiple clouds
 # ---------------------------------------------------------------------------
+
 
 def merge_pointclouds(
     clouds: list[np.ndarray],
@@ -121,13 +125,14 @@ def merge_pointclouds(
     -------
     (ΣNᵢ, C) merged point cloud.
     """
-    transformed = [transform_points(c, T) for c, T in zip(clouds, poses)]
+    transformed = [transform_points(c, T) for c, T in zip(clouds, poses, strict=False)]
     return np.concatenate(transformed, axis=0)
 
 
 # ---------------------------------------------------------------------------
 # 4. Voxel down-sampling
 # ---------------------------------------------------------------------------
+
 
 def voxel_downsample(
     points: np.ndarray,
@@ -158,11 +163,7 @@ def voxel_downsample(
     mins = voxel_idx.min(axis=0)
     shifted = voxel_idx - mins
     dims = shifted.max(axis=0) + 1
-    keys = (
-        shifted[:, 0] * (dims[1] * dims[2])
-        + shifted[:, 1] * dims[2]
-        + shifted[:, 2]
-    )
+    keys = shifted[:, 0] * (dims[1] * dims[2]) + shifted[:, 1] * dims[2] + shifted[:, 2]
 
     order = np.argsort(keys)
     sorted_keys = keys[order]
@@ -179,6 +180,7 @@ def voxel_downsample(
 # ---------------------------------------------------------------------------
 # 5. Normal estimation (PCA)
 # ---------------------------------------------------------------------------
+
 
 def estimate_normals(
     points: np.ndarray,
@@ -205,18 +207,18 @@ def estimate_normals(
     (N, 3) unit normals.
     """
     tree = KDTree(points)
-    _, idx = tree.query(points, k=k)                   # (N, k)
+    _, idx = tree.query(points, k=k)  # (N, k)
 
-    neighbours = points[idx]                            # (N, k, 3)
+    neighbours = points[idx]  # (N, k, 3)
     centroids = neighbours.mean(axis=1, keepdims=True)  # (N, 1, 3)
-    diff = neighbours - centroids                       # (N, k, 3)
+    diff = neighbours - centroids  # (N, k, 3)
 
     # Covariance per point: (3, k) @ (k, 3) → (3, 3)  batched.
-    cov = np.einsum("nki,nkj->nij", diff, diff) / k    # (N, 3, 3)
+    cov = np.einsum("nki,nkj->nij", diff, diff) / k  # (N, 3, 3)
 
     # SVD — columns of V are eigenvectors sorted descending by σ.
-    _, _, Vt = np.linalg.svd(cov)                       # Vt: (N, 3, 3)
-    normals = Vt[:, -1, :]                              # smallest eigenvalue
+    _, _, Vt = np.linalg.svd(cov)  # Vt: (N, 3, 3)
+    normals = Vt[:, -1, :]  # smallest eigenvalue
 
     # Orient normals towards the camera (assume +Z viewpoint).
     flip = normals[:, 2] > 0
@@ -230,6 +232,7 @@ def estimate_normals(
 # ---------------------------------------------------------------------------
 # 6. ICP (Iterative Closest Point)
 # ---------------------------------------------------------------------------
+
 
 def icp_align(
     source: np.ndarray,
@@ -284,7 +287,7 @@ def icp_align(
         src_c = src - src_mean
         tgt_c = matched - tgt_mean
 
-        H = src_c.T @ tgt_c                            # (3, 3)
+        H = src_c.T @ tgt_c  # (3, 3)
         U, _, Vt = np.linalg.svd(H)
         V = Vt.T
 
@@ -301,7 +304,7 @@ def icp_align(
         step[:3, 3] = t
         T_accum = step @ T_accum
 
-        mse = float(np.mean(dists ** 2))
+        mse = float(np.mean(dists**2))
         if abs(prev_mse - mse) < tolerance:
             return T_accum, dists, i + 1
         prev_mse = mse
@@ -313,6 +316,7 @@ def icp_align(
 # ---------------------------------------------------------------------------
 # 7. Statistical outlier removal
 # ---------------------------------------------------------------------------
+
 
 def remove_outliers(
     points: np.ndarray,
@@ -341,8 +345,11 @@ def remove_outliers(
     mask     : (N,) bool — True for inliers.
     """
     tree = KDTree(points[:, :3])
-    dists, _ = tree.query(points[:, :3], k=k + 1)      # +1 because self is first
-    mean_dists = dists[:, 1:].mean(axis=1)              # skip self
+    # scipy returns inf distances when k exceeds the point count — clamp so
+    # small clouds still yield finite per-point statistics.
+    k = min(k, len(points) - 1)
+    dists, _ = tree.query(points[:, :3], k=k + 1)  # +1 because self is first
+    mean_dists = dists[:, 1:].mean(axis=1)  # skip self
 
     global_mean = mean_dists.mean()
     global_std = mean_dists.std()
@@ -356,11 +363,26 @@ def remove_outliers(
 # 8. Poisson surface reconstruction (Open3D wrapper)
 # ---------------------------------------------------------------------------
 
+
+@dataclass(frozen=True)
+class TriangleMeshData:
+    """A triangle mesh as plain arrays.
+
+    Open3D exposes ``TriangleMesh`` through pybind11, which carries no type
+    information, so its ``vertices``/``triangles`` attributes are invisible to
+    type checkers.  Returning the two arrays in a typed container keeps the
+    mesh usable from typed code without an opaque handle.
+    """
+
+    vertices: np.ndarray
+    triangles: np.ndarray
+
+
 def poisson_reconstruct(
     points: np.ndarray,
     normals: np.ndarray,
     depth: int = 8,
-) -> object:
+) -> TriangleMeshData:
     """Surface reconstruction via the Poisson equation.
 
     The Poisson approach (Kazhdan et al. 2006) solves:
@@ -388,7 +410,10 @@ def poisson_reconstruct(
 
     Returns
     -------
-    mesh : open3d.geometry.TriangleMesh (vertices + triangles).
+    mesh : TriangleMeshData
+        Vertices ``(V, 3)`` and triangle indices ``(T, 3)``.  Open3D's
+        ``TriangleMesh`` is a pybind11 type with no type information, so the
+        two arrays it carries are returned in a typed container instead.
 
     Raises
     ------
@@ -398,15 +423,18 @@ def poisson_reconstruct(
         import open3d as o3d
     except ImportError as exc:
         raise ImportError(
-            "Poisson reconstruction requires Open3D.  "
-            "Install with:  pip install open3d"
+            "Poisson reconstruction requires Open3D.  Install with:  pip install open3d"
         ) from exc
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64))
     pcd.normals = o3d.utility.Vector3dVector(normals.astype(np.float64))
 
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        pcd, depth=depth,
+    mesh, _densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd,
+        depth=depth,
     )
-    return mesh
+    return TriangleMeshData(
+        vertices=np.asarray(mesh.vertices, dtype=np.float64),
+        triangles=np.asarray(mesh.triangles, dtype=np.int64),
+    )
