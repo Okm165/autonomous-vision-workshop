@@ -33,12 +33,12 @@ References
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import sparse
 from scipy.cluster.vq import kmeans2, vq
+from scipy.sparse import csc_matrix as _csc_matrix
 from scipy.sparse.linalg import spsolve
 
 from src.transforms import (
@@ -95,25 +95,26 @@ def _se3_ad_matrix(xi: NDArray[np.float64]) -> NDArray[np.float64]:
 def _se3_right_jacobian_inv(xi: NDArray[np.float64]) -> NDArray[np.float64]:
     r"""Approximate inverse right Jacobian of SE(3) via the BCH series.
 
-    The inverse *left* Jacobian admits the Bernoulli-number series
+    The inverse *right* Jacobian is truncated to second order as
 
     .. math::
 
-        \mathcal{J}_l^{-1}(\xi) =
-        \sum_{k=0}^{\infty} \frac{B_k}{k!}\,\mathrm{ad}(\xi)^k
-
-    with standard Bernoulli numbers B_0=1, B_1=-1/2, B_2=1/6, ...
-    The *right* Jacobian inverse is obtained via
-    :math:`\mathcal{J}_r^{-1}(\xi) = \mathcal{J}_l^{-1}(-\xi)`, which
-    flips the sign of odd-order terms.  Truncating at second order gives:
-
-    .. math::
-
-        \mathcal{J}_r^{-1}(\xi) \approx
+        \mathcal{I}_r(\xi) \approx
         I_6 + \tfrac{1}{2}\,\mathrm{ad}(\xi)
             + \tfrac{1}{12}\,\mathrm{ad}(\xi)^2
 
-    This approximation is accurate to O(||xi||^3) and is the standard
+    This is the standard truncation used in iterative graph-SLAM solvers, and
+    it is the coefficient that makes the first-order BCH identity
+
+    .. math::
+
+        \operatorname{Log}\!\bigl(\operatorname{Exp}(a)\operatorname{Exp}(b)\bigr)
+        \approx a + \mathcal{I}_r(a)\,b
+
+    hold, which is exactly how this function is consumed by
+    :meth:`PoseGraph.optimize`.
+
+    The approximation is accurate to O(||xi||^3) and is the standard
     choice in iterative graph-SLAM solvers where the error xi is driven
     toward zero during optimisation.
 
@@ -135,9 +136,7 @@ def _se3_right_jacobian_inv(xi: NDArray[np.float64]) -> NDArray[np.float64]:
 # ===================================================================
 
 
-def huber_kernel(
-    residual: float, delta: float = 1.0
-) -> Tuple[float, float]:
+def huber_kernel(residual: float, delta: float = 1.0) -> tuple[float, float]:
     r"""Huber robust cost function.
 
     .. math::
@@ -184,9 +183,7 @@ def huber_kernel(
     return delta * (abs_r - 0.5 * delta), delta / abs_r
 
 
-def cauchy_kernel(
-    residual: float, c: float = 1.0
-) -> Tuple[float, float]:
+def cauchy_kernel(residual: float, c: float = 1.0) -> tuple[float, float]:
     r"""Cauchy (Lorentzian) robust cost function.
 
     .. math::
@@ -225,7 +222,8 @@ def cauchy_kernel(
 
 
 def geman_mcclure_kernel(
-    residual: float, c: float = 1.0,
+    residual: float,
+    c: float = 1.0,
 ) -> tuple[float, float]:
     r"""Geman–McClure robust cost.
 
@@ -253,8 +251,8 @@ def geman_mcclure_kernel(
     cost : robust cost ρ(r)
     weight : IRLS weight w(r)
     """
-    r2 = residual ** 2
-    c2 = c ** 2
+    r2 = residual**2
+    c2 = c**2
     cost = 0.5 * r2 / (c2 + r2)
     # IRLS weight: w(r) = ρ'(r)/r = c² / (c² + r²)²
     weight = c2 / (c2 + r2) ** 2
@@ -340,10 +338,8 @@ class PoseGraph:
 
     def __init__(self) -> None:
         """Initialise an empty pose graph with no nodes or edges."""
-        self.poses: List[NDArray[np.float64]] = []
-        self.edges: List[
-            Tuple[int, int, NDArray[np.float64], NDArray[np.float64]]
-        ] = []
+        self.poses: list[NDArray[np.float64]] = []
+        self.edges: list[tuple[int, int, NDArray[np.float64], NDArray[np.float64]]] = []
 
     # ------------------------------------------------------------------
     # Graph construction
@@ -371,7 +367,7 @@ class PoseGraph:
         i: int,
         j: int,
         relative_pose: NDArray[np.float64],
-        information: Optional[NDArray[np.float64]] = None,
+        information: NDArray[np.float64] | None = None,
     ) -> None:
         """Add a loop closure edge to the pose graph."""
         if information is None:
@@ -383,7 +379,7 @@ class PoseGraph:
         i: int,
         j: int,
         T_ij: NDArray[np.float64],
-        information: Optional[NDArray[np.float64]] = None,
+        information: NDArray[np.float64] | None = None,
     ) -> None:
         r"""Add a relative-pose constraint between nodes i and j.
 
@@ -420,15 +416,13 @@ class PoseGraph:
         """
         T_ij_inv = se3_inverse(T_ij)
         T_i_inv = se3_inverse(self.poses[i])
-        return se3_log(
-            se3_compose(T_ij_inv, se3_compose(T_i_inv, self.poses[j]))
-        )
+        return se3_log(se3_compose(T_ij_inv, se3_compose(T_i_inv, self.poses[j])))
 
     def optimize(
         self,
         n_iterations: int = 10,
-        fixed_nodes: Optional[List[int]] = None,
-    ) -> List[NDArray[np.float64]]:
+        fixed_nodes: list[int] | None = None,
+    ) -> list[NDArray[np.float64]]:
         r"""Optimise the pose graph via Gauss-Newton on SE(3).
 
         Algorithm
@@ -478,28 +472,31 @@ class PoseGraph:
                 )
 
                 Ji = -(Jr_inv @ Ad_ji)  # (6, 6)
-                Jj = Jr_inv             # (6, 6)
+                Jj = Jr_inv  # (6, 6)
 
                 si, sj = 6 * i, 6 * j
 
-                H[si:si + 6, si:si + 6] += Ji.T @ info @ Ji
-                H[si:si + 6, sj:sj + 6] += Ji.T @ info @ Jj
-                H[sj:sj + 6, si:si + 6] += Jj.T @ info @ Ji
-                H[sj:sj + 6, sj:sj + 6] += Jj.T @ info @ Jj
+                H[si : si + 6, si : si + 6] += Ji.T @ info @ Ji
+                H[si : si + 6, sj : sj + 6] += Ji.T @ info @ Jj
+                H[sj : sj + 6, si : si + 6] += Jj.T @ info @ Ji
+                H[sj : sj + 6, sj : sj + 6] += Jj.T @ info @ Jj
 
                 info_e = info @ e_ij
-                b[si:si + 6] += Ji.T @ info_e
-                b[sj:sj + 6] += Jj.T @ info_e
+                b[si : si + 6] += Ji.T @ info_e
+                b[sj : sj + 6] += Jj.T @ info_e
 
             for idx in fixed_set:
                 s = 6 * idx
-                H[s:s + 6, :] = 0.0
-                H[:, s:s + 6] = 0.0
-                H[s:s + 6, s:s + 6] = np.eye(6)
-                b[s:s + 6] = 0.0
+                H[s : s + 6, :] = 0.0
+                H[:, s : s + 6] = 0.0
+                H[s : s + 6, s : s + 6] = np.eye(6)
+                b[s : s + 6] = 0.0
 
-            H_sp = sparse.csc_matrix(H)
-            dx = spsolve(H_sp, -b)
+            H_sp = _csc_matrix(H)
+            # spsolve returns an ndarray for a dense right-hand side, but a
+            # sparse matrix when the RHS is sparse; coerce to a dense 1-D
+            # vector so the slicing / norm below is well-typed and correct.
+            dx = np.asarray(spsolve(H_sp, -b), dtype=np.float64).ravel()
 
             for k in range(n):
                 if k not in fixed_set:
@@ -625,10 +622,10 @@ class BundleAdjuster:
 
     def __init__(self) -> None:
         """Initialise an empty bundle adjustment problem."""
-        self.cameras: List[NDArray[np.float64]] = []
-        self.points: List[NDArray[np.float64]] = []
-        self.observations: List[Tuple[int, int, float, float]] = []
-        self.K: Optional[NDArray[np.float64]] = None
+        self.cameras: list[NDArray[np.float64]] = []
+        self.points: list[NDArray[np.float64]] = []
+        self.observations: list[tuple[int, int, float, float]] = []
+        self.K: NDArray[np.float64] | None = None
 
     # ------------------------------------------------------------------
     # Graph construction
@@ -695,9 +692,7 @@ class BundleAdjuster:
             Observed pixel coordinates (u, v).
         """
         pixel = np.asarray(pixel, dtype=np.float64).ravel()
-        self.observations.append(
-            (cam_idx, pt_idx, float(pixel[0]), float(pixel[1]))
-        )
+        self.observations.append((cam_idx, pt_idx, float(pixel[0]), float(pixel[1])))
 
     # ------------------------------------------------------------------
     # Projection Jacobian
@@ -709,7 +704,7 @@ class BundleAdjuster:
         R: NDArray[np.float64],
         t: NDArray[np.float64],
         X: NDArray[np.float64],
-    ) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         r"""Jacobians of the projection w.r.t. camera pose and 3-D point.
 
         Given the **world-to-camera** rotation R and translation t, the
@@ -766,17 +761,19 @@ class BundleAdjuster:
         Z_inv = 1.0 / Zc
         Z_inv2 = Z_inv * Z_inv
 
-        dpi_dP = np.array([
-            [fx * Z_inv, 0.0,        -fx * Xc * Z_inv2],
-            [0.0,        fy * Z_inv, -fy * Yc * Z_inv2],
-        ])
+        dpi_dP = np.array(
+            [
+                [fx * Z_inv, 0.0, -fx * Xc * Z_inv2],
+                [0.0, fy * Z_inv, -fy * Yc * Z_inv2],
+            ]
+        )
 
         dP_dxi = np.zeros((3, 6))
         dP_dxi[:, :3] = -np.eye(3)
         dP_dxi[:, 3:] = skew(P)
 
-        J_cam = dpi_dP @ dP_dxi       # (2, 6)
-        J_point = dpi_dP @ R           # (2, 3)
+        J_cam = dpi_dP @ dP_dxi  # (2, 6)
+        J_point = dpi_dP @ R  # (2, 3)
 
         return J_cam, J_point
 
@@ -790,10 +787,19 @@ class BundleAdjuster:
         pt_idx: int,
         u_obs: float,
         v_obs: float,
-        robust_kernel: Optional[Callable[[float], Tuple[float, float]]],
-    ) -> Optional[
-        Tuple[NDArray[np.float64], float, NDArray[np.float64], NDArray[np.float64], int, int]
-    ]:
+        robust_kernel: Callable[[float], tuple[float, float]] | None,
+    ) -> (
+        tuple[
+            NDArray[np.float64],
+            float,
+            NDArray[np.float64],
+            NDArray[np.float64],
+            int,
+            int,
+        ]
+        | None
+    ):
+        assert self.K is not None, "camera intrinsics not set"
         T_cw = self.cameras[cam_idx]
         T_wc = se3_inverse(T_cw)
         R_wc, t_wc = se3_to_Rt(T_wc)
@@ -805,10 +811,12 @@ class BundleAdjuster:
 
         fx, fy = self.K[0, 0], self.K[1, 1]
         cx, cy = self.K[0, 2], self.K[1, 2]
-        proj = np.array([
-            fx * P[0] / P[2] + cx,
-            fy * P[1] / P[2] + cy,
-        ])
+        proj = np.array(
+            [
+                fx * P[0] / P[2] + cx,
+                fy * P[1] / P[2] + cy,
+            ]
+        )
 
         e = proj - np.array([u_obs, v_obs])
 
@@ -825,32 +833,32 @@ class BundleAdjuster:
         self,
         H_cc: NDArray[np.float64],
         H_cp: NDArray[np.float64],
-        H_pp_blocks: List[NDArray[np.float64]],
+        H_pp_blocks: list[NDArray[np.float64]],
         b_c: NDArray[np.float64],
         b_p: NDArray[np.float64],
         n_p: int,
         cam_dim: int,
-        fix_set: set,
+        fix_set: set[int],
         damping: float,
-    ) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         S = H_cc.copy()
         Hpp_inv_bp = np.zeros(3 * n_p)
 
         for k in range(n_p):
             s = 3 * k
             block_inv = np.linalg.inv(H_pp_blocks[k] + damping * np.eye(3))
-            Hcp_k = H_cp[:, s:s + 3]
+            Hcp_k = H_cp[:, s : s + 3]
             S -= Hcp_k @ (block_inv @ Hcp_k.T)
-            Hpp_inv_bp[s:s + 3] = block_inv @ b_p[s:s + 3]
+            Hpp_inv_bp[s : s + 3] = block_inv @ b_p[s : s + 3]
 
         rhs_c = -(b_c - H_cp @ Hpp_inv_bp)
 
         for idx in fix_set:
             s = 6 * idx
-            S[s:s + 6, :] = 0.0
-            S[:, s:s + 6] = 0.0
-            S[s:s + 6, s:s + 6] = np.eye(6)
-            rhs_c[s:s + 6] = 0.0
+            S[s : s + 6, :] = 0.0
+            S[:, s : s + 6] = 0.0
+            S[s : s + 6, s : s + 6] = np.eye(6)
+            rhs_c[s : s + 6] = 0.0
 
         S += damping * np.eye(cam_dim)
         dx_c = np.linalg.solve(S, rhs_c)
@@ -860,11 +868,9 @@ class BundleAdjuster:
         for k in range(n_p):
             s = 3 * k
             block_inv = np.linalg.inv(H_pp_blocks[k] + damping * np.eye(3))
-            dx_p[s:s + 3] = block_inv @ (
-                -b_p[s:s + 3] - H_pc[s:s + 3, :] @ dx_c
-            )
+            dx_p[s : s + 3] = block_inv @ (-b_p[s : s + 3] - H_pc[s : s + 3, :] @ dx_c)
 
-        return dx_c, dx_p
+        return np.asarray(dx_c, dtype=np.float64), dx_p
 
     def _apply_pose_updates(
         self,
@@ -872,7 +878,7 @@ class BundleAdjuster:
         dx_p: NDArray[np.float64],
         n_c: int,
         n_p: int,
-        fix_set: set,
+        fix_set: set[int],
     ) -> None:
         for k in range(n_c):
             if k not in fix_set:
@@ -890,10 +896,10 @@ class BundleAdjuster:
     def optimize(
         self,
         n_iterations: int = 10,
-        fix_cameras: Optional[List[int]] = None,
-        robust_kernel: Optional[Callable[[float], Tuple[float, float]]] = None,
+        fix_cameras: list[int] | None = None,
+        robust_kernel: Callable[[float], tuple[float, float]] | None = None,
         damping: float = 1e-6,
-    ) -> Tuple[List[NDArray[np.float64]], List[NDArray[np.float64]]]:
+    ) -> tuple[list[NDArray[np.float64]], list[NDArray[np.float64]]]:
         r"""Run Gauss-Newton bundle adjustment with the Schur complement.
 
         Parameters
@@ -928,7 +934,7 @@ class BundleAdjuster:
         for _ in range(n_iterations):
             H_cc = np.zeros((cam_dim, cam_dim))
             H_cp = np.zeros((cam_dim, 3 * n_p))
-            H_pp_blocks: List[NDArray[np.float64]] = [
+            H_pp_blocks: list[NDArray[np.float64]] = [
                 np.zeros((3, 3)) for _ in range(n_p)
             ]
             b_c = np.zeros(cam_dim)
@@ -936,21 +942,32 @@ class BundleAdjuster:
 
             for cam_idx, pt_idx, u_obs, v_obs in self.observations:
                 result = self._project_observation(
-                    cam_idx, pt_idx, u_obs, v_obs, robust_kernel,
+                    cam_idx,
+                    pt_idx,
+                    u_obs,
+                    v_obs,
+                    robust_kernel,
                 )
                 if result is None:
                     continue
                 e, w, Jc, Jp, si, pi = result
 
-                H_cc[si:si + 6, si:si + 6] += w * (Jc.T @ Jc)
-                H_cp[si:si + 6, pi:pi + 3] += w * (Jc.T @ Jp)
+                H_cc[si : si + 6, si : si + 6] += w * (Jc.T @ Jc)
+                H_cp[si : si + 6, pi : pi + 3] += w * (Jc.T @ Jp)
                 H_pp_blocks[pt_idx] += w * (Jp.T @ Jp)
-                b_c[si:si + 6] += w * (Jc.T @ e)
-                b_p[pi:pi + 3] += w * (Jp.T @ e)
+                b_c[si : si + 6] += w * (Jc.T @ e)
+                b_p[pi : pi + 3] += w * (Jp.T @ e)
 
             dx_c, dx_p = self._schur_complement_solve(
-                H_cc, H_cp, H_pp_blocks, b_c, b_p,
-                n_p, cam_dim, fix_set, damping,
+                H_cc,
+                H_cp,
+                H_pp_blocks,
+                b_c,
+                b_p,
+                n_p,
+                cam_dim,
+                fix_set,
+                damping,
             )
 
             self._apply_pose_updates(dx_c, dx_p, n_c, n_p, fix_set)
@@ -1020,16 +1037,14 @@ class LoopDetector:
         self.vocab_size: int = vocab_size
         self.similarity_threshold: float = similarity_threshold
 
-        self.vocabulary: Optional[NDArray[np.float64]] = None
-        self.keyframes: Dict[int, NDArray[np.float64]] = {}
+        self.vocabulary: NDArray[np.float64] | None = None
+        self.keyframes: dict[int, NDArray[np.float64]] = {}
 
     # ------------------------------------------------------------------
     # Vocabulary construction
     # ------------------------------------------------------------------
 
-    def build_vocabulary(
-        self, all_descriptors: NDArray[np.float64]
-    ) -> None:
+    def build_vocabulary(self, all_descriptors: NDArray[np.float64]) -> None:
         r"""Build the visual vocabulary via k-means clustering.
 
         Partitions the descriptor space into :attr:`vocab_size` Voronoi
@@ -1061,24 +1076,17 @@ class LoopDetector:
     # Keyframe management
     # ------------------------------------------------------------------
 
-    def _to_histogram(
-        self, descriptors: NDArray[np.float64]
-    ) -> NDArray[np.float64]:
+    def _to_histogram(self, descriptors: NDArray[np.float64]) -> NDArray[np.float64]:
         """Convert a set of descriptors to an L2-normalised BoW histogram."""
-        codes, _ = vq(
-            np.asarray(descriptors, dtype=np.float64), self.vocabulary
-        )
-        hist = np.bincount(
-            codes, minlength=len(self.vocabulary)
-        ).astype(np.float64)
+        assert self.vocabulary is not None, "vocabulary not built"
+        codes, _ = vq(np.asarray(descriptors, dtype=np.float64), self.vocabulary)
+        hist = np.bincount(codes, minlength=len(self.vocabulary)).astype(np.float64)
         norm = np.linalg.norm(hist)
         if norm > _EPS:
             hist /= norm
         return hist
 
-    def add_keyframe(
-        self, frame_id: int, descriptors: NDArray[np.float64]
-    ) -> None:
+    def add_keyframe(self, frame_id: int, descriptors: NDArray[np.float64]) -> None:
         """Register a keyframe's descriptors in the database.
 
         Parameters
@@ -1095,8 +1103,7 @@ class LoopDetector:
         """
         if self.vocabulary is None:
             raise RuntimeError(
-                "Visual vocabulary has not been built.  "
-                "Call build_vocabulary() first."
+                "Visual vocabulary has not been built.  Call build_vocabulary() first."
             )
         self.keyframes[frame_id] = self._to_histogram(descriptors)
 
@@ -1104,9 +1111,7 @@ class LoopDetector:
     # Loop detection
     # ------------------------------------------------------------------
 
-    def detect_loop(
-        self, descriptors: NDArray[np.float64]
-    ) -> List[Tuple[int, float]]:
+    def detect_loop(self, descriptors: NDArray[np.float64]) -> list[tuple[int, float]]:
         r"""Check whether the current frame closes a loop.
 
         Computes the BoW histogram of the query descriptors and compares
@@ -1128,7 +1133,7 @@ class LoopDetector:
             return []
 
         query_hist = self._to_histogram(descriptors)
-        candidates: List[Tuple[int, float]] = []
+        candidates: list[tuple[int, float]] = []
 
         for fid, stored_hist in self.keyframes.items():
             sim = float(np.dot(query_hist, stored_hist))

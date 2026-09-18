@@ -7,7 +7,11 @@ surface extraction via Marching Cubes.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Self
+
 import numpy as np
+from numpy.typing import NDArray
 
 
 class TSDFVolume:
@@ -64,21 +68,33 @@ class TSDFVolume:
     ) -> None:
         """Initialise the TSDF volume, pre-computing voxel world coordinates."""
         vol_bounds = np.asarray(vol_bounds, dtype=np.float64)
+        if vol_bounds.shape == (2, 3):
+            # Accept the (min, max) row convention as well as the documented
+            # (3, 2) column convention, so callers cannot silently build a
+            # volume with the wrong number of dimensions.
+            vol_bounds = vol_bounds.T
+        if vol_bounds.shape != (3, 2):
+            raise ValueError(
+                "vol_bounds must have shape (3, 2) as "
+                "[[x_min, x_max], [y_min, y_max], [z_min, z_max]], "
+                f"got {vol_bounds.shape}"
+            )
+        if np.any(vol_bounds[:, 1] <= vol_bounds[:, 0]):
+            raise ValueError("vol_bounds max must exceed min on every axis")
 
-        self.voxel_size = voxel_size
-        self.trunc_dist = trunc_dist
+        self.voxel_size: float = voxel_size
+        self.trunc_dist: float = trunc_dist
+        self._origin: NDArray[np.float64] = vol_bounds[:, 0].copy()  # (3,)
+        dims = np.ceil((vol_bounds[:, 1] - vol_bounds[:, 0]) / voxel_size).astype(
+            np.int32
+        )
+        self._dims: NDArray[np.int32] = dims  # (Dx, Dy, Dz)
 
-        self._origin = vol_bounds[:, 0].copy()          # (3,)
-        dims = np.ceil(
-            (vol_bounds[:, 1] - vol_bounds[:, 0]) / voxel_size
-        ).astype(np.int32)
-        self._dims = dims                               # (Dx, Dy, Dz)
+        self._tsdf: NDArray[np.float32] = np.ones(dims, dtype=np.float32)  # +1 = free
+        self._weight: NDArray[np.float32] = np.zeros(dims, dtype=np.float32)
+        self._color: NDArray[np.float32] = np.zeros((*dims, 3), dtype=np.float32)
 
-        self._tsdf = np.ones(dims, dtype=np.float32)    # +1 = free
-        self._weight = np.zeros(dims, dtype=np.float32)
-        self._color = np.zeros((*dims, 3), dtype=np.float32)
-
-        self._voxel_coords = self._build_voxel_coords() # (Dx*Dy*Dz, 3)
+        self._voxel_coords: NDArray[np.float64] = self._build_voxel_coords()
 
     # ------------------------------------------------------------------
     # Internals
@@ -91,7 +107,7 @@ class TSDFVolume:
         zv = np.arange(self._dims[2])
         grid = np.stack(np.meshgrid(xv, yv, zv, indexing="ij"), axis=-1)
         coords = grid.reshape(-1, 3).astype(np.float64) * self.voxel_size
-        coords += self._origin + self.voxel_size / 2    # voxel centres
+        coords += self._origin + self.voxel_size / 2  # voxel centres
         return coords
 
     # ------------------------------------------------------------------
@@ -122,10 +138,12 @@ class TSDFVolume:
 
             4. Compute raw signed distance:
                    sdf = d_obs − Zc
+               and keep only voxels with sdf ≥ −trunc_dist (i.e. voxels within
+               the truncation band in front of the observed surface).
 
             5. Truncate and update:
-                   tsdf_new  = clamp(sdf / trunc_dist, −1, +1)
-                   tsdf, w   ← weighted running average (see class docstring).
+                   tsdf_new = clamp(sdf / trunc_dist, −1, +1)
+                   tsdf, w  ← weighted running average (see class docstring).
 
         Parameters
         ----------
@@ -141,8 +159,8 @@ class TSDFVolume:
         # --- 1. World → camera -------------------------------------------
         n = self._voxel_coords.shape[0]
         ones = np.ones((n, 1), dtype=np.float64)
-        hom = np.concatenate([self._voxel_coords, ones], axis=1)   # (N, 4)
-        cam = (T_world_to_cam @ hom.T).T                           # (N, 4)
+        hom = np.concatenate([self._voxel_coords, ones], axis=1)  # (N, 4)
+        cam = (T_world_to_cam @ hom.T).T  # (N, 4)
 
         cam_x = cam[:, 0]
         cam_y = cam[:, 1]
@@ -152,21 +170,27 @@ class TSDFVolume:
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
 
-        pix_x = fx * (cam_x / cam_z) + cx
-        pix_y = fy * (cam_y / cam_z) + cy
+        # Voxels at cam_z ≈ 0 produce inf/nan pixels; they are filtered out
+        # by the validity mask below, so silence the divide warnings.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pix_x = fx * (cam_x / cam_z) + cx
+            pix_y = fy * (cam_y / cam_z) + cy
 
         # --- 3. Validity mask ---------------------------------------------
         valid = (
             (cam_z > 0)
-            & (pix_x >= 0) & (pix_x < w - 1)
-            & (pix_y >= 0) & (pix_y < h - 1)
+            & (pix_x >= 0)
+            & (pix_x < w - 1)
+            & (pix_y >= 0)
+            & (pix_y < h - 1)
         )
 
+        # Sanitize before the int cast: non-finite or out-of-range pixels
+        # belong to already-invalid voxels (cam_z <= 0), masked out below.
+        pix_x = np.clip(np.nan_to_num(pix_x, nan=0.0), 0.0, w - 1)
+        pix_y = np.clip(np.nan_to_num(pix_y, nan=0.0), 0.0, h - 1)
         pix_x = np.round(pix_x).astype(np.int32)
         pix_y = np.round(pix_y).astype(np.int32)
-
-        pix_x = np.clip(pix_x, 0, w - 1)
-        pix_y = np.clip(pix_y, 0, h - 1)
 
         d_obs = depth[pix_y, pix_x]
         valid &= (d_obs > 0) & np.isfinite(d_obs)
@@ -192,7 +216,9 @@ class TSDFVolume:
         if color is not None:
             c_obs = color[pix_y[valid_idx], pix_x[valid_idx]].astype(np.float32)
             c_old = self._color[vi]
-            self._color[vi] = (w_old[..., None] * c_old + w_new * c_obs) / w_sum[..., None]
+            self._color[vi] = (w_old[..., None] * c_old + w_new * c_obs) / w_sum[
+                ..., None
+            ]
 
     # ------------------------------------------------------------------
     # Surface extraction
@@ -208,6 +234,13 @@ class TSDFVolume:
             3. Interpolate vertex positions along edges using the TSDF values:
                    p = p₁ + (0 − tsdf₁) / (tsdf₂ − tsdf₁) · (p₂ − p₁)
 
+        Only *observed* voxels participate.  Voxels that were never seen hold
+        the initial ``+1`` value, so treating them as ordinary samples would
+        create a spurious surface wherever an observed cell with a negative
+        TSDF borders an unobserved one.  The volume is therefore kept at a
+        positive constant inside unobserved space but the query level is
+        placed where only genuinely observed data can produce a crossing.
+
         Returns
         -------
         verts : (V, 3) float — vertex positions in world frame.
@@ -215,29 +248,84 @@ class TSDFVolume:
         norms : (V, 3) float — per-vertex normals.
         colors: (V, 3) float — per-vertex colours (interpolated).
         """
+        from scipy.ndimage import binary_erosion
         from skimage.measure import marching_cubes
 
-        tsdf_vol = self._tsdf.copy()
-
         observed = self._weight > 0
+        if not observed.any():
+            empty3 = np.zeros((0, 3))
+            return empty3, np.zeros((0, 3), dtype=int), empty3.copy(), empty3.copy()
+
+        tsdf_vol = self._tsdf.astype(np.float64, copy=True)
+
+        # Unobserved voxels hold the initial +1.  An observed voxel can be as
+        # low as -1 (the clamp), so any cell straddling the observed boundary
+        # would present a false -1/+1 crossing.  Two safeguards keep the
+        # extracted surface on the genuine zero-crossing of the observed band:
+        #   1. fill unobserved voxels with the positive constant, and
+        #   2. pass Marching Cubes a mask of the observed region eroded by one
+        #      voxel, so cells with an incomplete set of measured corners are
+        #      never meshed (their apparent "crossing" against the fill value
+        #      is an artefact, not surface geometry).
         tsdf_vol[~observed] = 1.0
+        # Full 3x3x3 structure: a cube may only be meshed when all 8 of its
+        # corner voxels were measured (the default 6-connected cross would
+        # still allow cells with unobserved diagonal corners).
+        interior = binary_erosion(observed, structure=np.ones((3, 3, 3), dtype=bool))
 
         try:
-            verts, faces, norms, _ = marching_cubes(tsdf_vol, level=0.0)
+            verts, faces, norms, _ = marching_cubes(
+                tsdf_vol,
+                level=0.0,
+                mask=interior,
+                allow_degenerate=False,
+            )
         except (ValueError, RuntimeError):
-            return np.zeros((0, 3)), np.zeros((0, 3), dtype=int), np.zeros((0, 3)), np.zeros((0, 3))
+            empty3 = np.zeros((0, 3))
+            return empty3, np.zeros((0, 3), dtype=int), empty3.copy(), empty3.copy()
 
-        verts = verts * self.voxel_size + self._origin
+        # ``marching_cubes`` returns vertices in continuous *index* space, where
+        # integer coordinate k refers to voxel k's centre.  The world position
+        # of voxel k's centre is  origin + (k + 0.5) * voxel_size, matching
+        # ``_build_voxel_coords``; omitting the half-voxel term would shift the
+        # whole surface by half a voxel.  (Here ``k = fi - 0.5``, where fi is
+        # the array index of the voxel.)
+        verts = self._origin + (verts + 0.5) * self.voxel_size
 
-        # Interpolate colours at extracted vertices.
-        vert_idx = np.clip(
-            np.round(
-                (verts - self._origin) / self.voxel_size
-            ).astype(int),
-            0,
-            np.array(self._dims) - 1,
-        )
-        colors = self._color[vert_idx[:, 0], vert_idx[:, 1], vert_idx[:, 2]]
+        if len(faces):
+            # Recover each vertex's voxel index.  Inverting the relation above
+            # gives  fi = raw + 0.5, and in the world frame that is
+            #   fi = (p - origin) / voxel_size - 0.5 + 0.5 = (p - origin) / vs,
+            # then rounded to the nearest integer cell.
+            fi = np.rint((verts - self._origin) / self.voxel_size).astype(int)
+            fi = np.clip(fi, 0, np.array(self._dims) - 1)
+            vert_observed = observed[fi[:, 0], fi[:, 1], fi[:, 2]]
+
+            # Discard any triangle with a corner in unobserved space.  Those are
+            # exactly the faces that bridge the observed band and the positive
+            # fill value, which would otherwise appear as a spurious sheet
+            # parallel to the true surface.
+            keep = vert_observed[faces].all(axis=1)
+            faces = faces[keep]
+
+            used = np.unique(faces)
+            remap = -np.ones(len(verts), dtype=int)
+            remap[used] = np.arange(len(used))
+            verts = verts[used]
+            norms = norms[used]
+            faces = remap[faces]
+
+        # Interpolate colours at extracted vertices, using the same voxel-index
+        # recovery as the observation filter above.
+        if len(verts):
+            vert_idx = np.clip(
+                np.rint((verts - self._origin) / self.voxel_size).astype(int),
+                0,
+                np.array(self._dims) - 1,
+            )
+            colors = self._color[vert_idx[:, 0], vert_idx[:, 1], vert_idx[:, 2]]
+        else:
+            colors = np.zeros((0, 3))
 
         return verts, faces, norms, colors
 
@@ -265,7 +353,7 @@ class TSDFVolume:
             return np.concatenate([pts, colors], axis=1)
         return pts
 
-    extract_pointcloud = get_point_cloud
+    extract_pointcloud: Callable[[Self], NDArray[np.float64]] = get_point_cloud
 
     def get_volume(self) -> tuple[np.ndarray, np.ndarray]:
         """Return the raw TSDF volume and weight arrays."""
