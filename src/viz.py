@@ -14,23 +14,30 @@ All plotting uses Matplotlib for portability.
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple, Union
+import contextlib
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+    from mpl_toolkits.mplot3d import Axes3D
 
 # ======================================================================
 #  3-D camera visualisation
 # ======================================================================
 
+
 def plot_cameras_3d(
     poses: Sequence[NDArray[np.float64]],
-    K: Optional[NDArray[np.float64]] = None,
-    ax: Optional[object] = None,
+    K: NDArray[np.float64] | None = None,
+    ax: Axes3D | None = None,
     scale: float = 0.3,
-    colors: Optional[Sequence] = None,
-) -> object:
+    colors: Sequence[str] | None = None,
+) -> Axes3D:
     r"""Visualise camera poses as coordinate frames in 3-D.
 
     Each camera is drawn as three arrows representing the local X (red),
@@ -59,7 +66,7 @@ def plot_cameras_3d(
 
     if ax is None:
         fig = plt.figure(figsize=(10, 8))
-        ax = fig.add_subplot(111, projection="3d")
+        ax = cast("Axes3D", fig.add_subplot(111, projection="3d"))
 
     for i, T in enumerate(poses):
         R = T[:3, :3]
@@ -76,7 +83,13 @@ def plot_cameras_3d(
 
         # Frustum
         if K is not None:
-            _draw_frustum(ax, T, K, scale * 0.8, colors[i] if colors else "cyan")
+            _draw_frustum(
+                ax,
+                T,
+                K,
+                scale * 0.8,
+                colors[i] if colors is not None and len(colors) > 0 else "cyan",
+            )
 
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
@@ -87,7 +100,7 @@ def plot_cameras_3d(
 
 
 def _draw_frustum(
-    ax: object,
+    ax: Axes3D,
     T: NDArray[np.float64],
     K: NDArray[np.float64],
     depth: float,
@@ -100,37 +113,45 @@ def _draw_frustum(
     hw = cx * depth / fx
     hh = cy * depth / fy
 
-    corners_cam = np.array([
-        [-hw, -hh, depth],
-        [hw, -hh, depth],
-        [hw, hh, depth],
-        [-hw, hh, depth],
-    ])
+    corners_cam = np.array(
+        [
+            [-hw, -hh, depth],
+            [hw, -hh, depth],
+            [hw, hh, depth],
+            [-hw, hh, depth],
+        ]
+    )
 
     R, t = T[:3, :3], T[:3, 3]
     corners_world = (R @ corners_cam.T).T + t
 
     for c in corners_world:
-        ax.plot3D([t[0], c[0]], [t[1], c[1]], [t[2], c[2]],
-                  color=color, alpha=0.4, linewidth=0.8)
+        ax.plot3D(
+            [t[0], c[0]],
+            [t[1], c[1]],
+            [t[2], c[2]],
+            color=color,
+            alpha=0.4,
+            linewidth=0.8,
+        )
 
     rect = np.vstack([corners_world, corners_world[0:1]])
-    ax.plot3D(rect[:, 0], rect[:, 1], rect[:, 2],
-              color=color, alpha=0.4, linewidth=0.8)
+    ax.plot3D(rect[:, 0], rect[:, 1], rect[:, 2], color=color, alpha=0.4, linewidth=0.8)
 
 
 # ======================================================================
 #  Point cloud plot
 # ======================================================================
 
+
 def plot_pointcloud_3d(
     points: NDArray[np.float64],
-    colors: Optional[NDArray] = None,
-    ax: Optional[object] = None,
+    colors: NDArray[np.float64] | None = None,
+    ax: Axes3D | None = None,
     subsample: int = 5000,
     point_size: float = 1.0,
     title: str = "Point Cloud",
-) -> object:
+) -> Axes3D:
     """Plot a 3-D point cloud in Matplotlib.
 
     Parameters
@@ -156,7 +177,7 @@ def plot_pointcloud_3d(
 
     if ax is None:
         fig = plt.figure(figsize=(10, 8))
-        ax = fig.add_subplot(111, projection="3d")
+        ax = cast("Axes3D", fig.add_subplot(111, projection="3d"))
 
     n = len(points)
     if n > subsample:
@@ -171,11 +192,9 @@ def plot_pointcloud_3d(
         clr = np.asarray(clr, dtype=np.float64)
         if clr.max() > 1.0:
             clr = clr / 255.0
-        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
-                   c=clr, s=point_size, marker=".")
+        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=clr, s=point_size, marker=".")
     else:
-        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
-                   s=point_size, marker=".", alpha=0.6)
+        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=point_size, marker=".", alpha=0.6)
 
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
@@ -190,14 +209,15 @@ def plot_pointcloud_3d(
 #  Depth map plot
 # ======================================================================
 
+
 def plot_depth_map(
     depth: NDArray[np.float64],
     title: str = "Depth Map",
     cmap: str = "turbo",
-    ax: Optional[object] = None,
-    vmin: Optional[float] = None,
-    vmax: Optional[float] = None,
-) -> object:
+    ax: Axes | None = None,
+    vmin: float | None = None,
+    vmax: float | None = None,
+) -> Axes:
     """Visualise a depth map with a colour bar.
 
     Parameters
@@ -219,7 +239,7 @@ def plot_depth_map(
     import matplotlib.pyplot as plt
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=(10, 6))
+        _fig, ax = plt.subplots(figsize=(10, 6))
 
     valid = depth[depth > 0]
     if vmin is None:
@@ -239,15 +259,16 @@ def plot_depth_map(
 #  Feature match visualisation
 # ======================================================================
 
+
 def plot_matches(
     img1: NDArray[np.uint8],
     kp1: NDArray[np.float64],
     img2: NDArray[np.uint8],
     kp2: NDArray[np.float64],
-    matches: Sequence[Tuple[int, int]],
-    inlier_mask: Optional[NDArray[np.bool_]] = None,
+    matches: Sequence[tuple[int, int]],
+    inlier_mask: NDArray[np.bool_] | None = None,
     max_draw: int = 50,
-) -> object:
+) -> Axes:
     """Draw feature matches between two images side by side.
 
     Inliers are drawn in green, outliers in red.
@@ -278,19 +299,23 @@ def plot_matches(
 
     canvas = np.zeros((h_out, w_out, 3), dtype=np.uint8)
     canvas[:h1, :w1] = img1 if img1.ndim == 3 else np.stack([img1] * 3, axis=-1)
-    canvas[:h2, w1:w1 + w2] = img2 if img2.ndim == 3 else np.stack([img2] * 3, axis=-1)
+    canvas[:h2, w1 : w1 + w2] = (
+        img2 if img2.ndim == 3 else np.stack([img2] * 3, axis=-1)
+    )
 
-    fig, ax = plt.subplots(figsize=(14, 6))
+    _fig, ax = plt.subplots(figsize=(14, 6))
     ax.imshow(canvas[:, :, ::-1] if canvas.shape[2] == 3 else canvas)
 
     n_draw = min(len(matches), max_draw)
     rng = np.random.default_rng(42)
-    draw_idx = (rng.choice(len(matches), n_draw, replace=False)
-                 if len(matches) > n_draw
-                 else np.arange(len(matches)))
+    draw_idx = (
+        rng.choice(len(matches), n_draw, replace=False)
+        if len(matches) > n_draw
+        else np.arange(len(matches))
+    )
 
     for k in draw_idx:
-        i1, i2 = matches[k]
+        i1, i2 = matches[int(k)]
         x1, y1 = kp1[i1]
         x2, y2 = kp2[i2]
 
@@ -312,10 +337,11 @@ def plot_matches(
 #  Animation helper
 # ======================================================================
 
+
 def make_video_frames(
     images: Sequence[NDArray[np.uint8]],
     fps: int = 10,
-) -> List[NDArray[np.uint8]]:
+) -> list[NDArray[np.uint8]]:
     """Create a list of frames suitable for animation / video encoding.
 
     Pads images to consistent dimensions and converts grayscale to BGR.
@@ -338,7 +364,7 @@ def make_video_frames(
     max_h = max(img.shape[0] for img in images)
     max_w = max(img.shape[1] for img in images)
 
-    frames: List[NDArray[np.uint8]] = []
+    frames: list[NDArray[np.uint8]] = []
     for img in images:
         if img.ndim == 2:
             img = np.stack([img, img, img], axis=-1)
@@ -354,15 +380,16 @@ def make_video_frames(
 #  Covariance ellipse
 # ======================================================================
 
+
 def plot_covariance_ellipse(
     mean: NDArray[np.float64],
     cov: NDArray[np.float64],
-    ax: Optional[object] = None,
+    ax: Axes | None = None,
     n_std: float = 2.0,
     color: str = "blue",
     alpha: float = 0.3,
-    label: Optional[str] = None,
-) -> object:
+    label: str | None = None,
+) -> Axes:
     r"""Plot a 2-D covariance ellipse.
 
     The ellipse represents the iso-contour of the Gaussian density at
@@ -408,8 +435,14 @@ def plot_covariance_ellipse(
     height = 2.0 * n_std * np.sqrt(eigenvalues[1])
 
     ellipse = Ellipse(
-        xy=mean, width=width, height=height, angle=angle,
-        edgecolor=color, facecolor=color, alpha=alpha, label=label,
+        xy=(float(mean[0]), float(mean[1])),
+        width=width,
+        height=height,
+        angle=angle,
+        edgecolor=color,
+        facecolor=color,
+        alpha=alpha,
+        label=label,
     )
     ax.add_patch(ellipse)
     ax.plot(*mean, "x", color=color, markersize=5)
@@ -421,10 +454,11 @@ def plot_covariance_ellipse(
 #  Helper: create 3-D axes
 # ======================================================================
 
+
 def create_3d_axes(
-    figsize: Tuple[int, int] = (10, 8),
+    figsize: tuple[int, int] = (10, 8),
     title: str = "",
-) -> object:
+) -> Axes3D:
     """Create Matplotlib 3-D axes with equal aspect ratio.
 
     Parameters
@@ -441,7 +475,7 @@ def create_3d_axes(
     import matplotlib.pyplot as plt
 
     fig = plt.figure(figsize=figsize)
-    ax = fig.add_subplot(111, projection="3d")
+    ax = cast("Axes3D", fig.add_subplot(111, projection="3d"))
     if title:
         ax.set_title(title)
     ax.set_xlabel("X")
@@ -455,12 +489,13 @@ def create_3d_axes(
 #  Trajectory plot
 # ======================================================================
 
+
 def plot_trajectory(
     poses: Sequence[NDArray[np.float64]],
-    gt_poses: Optional[Sequence[NDArray[np.float64]]] = None,
+    gt_poses: Sequence[NDArray[np.float64]] | None = None,
     title: str = "Trajectory",
-    ax: Optional[object] = None,
-) -> object:
+    ax: Axes | None = None,
+) -> Axes:
     """Plot camera trajectory from SE(3) poses (bird's-eye view).
 
     Parameters
@@ -500,6 +535,7 @@ def plot_trajectory(
 #  Depth colourmap
 # ======================================================================
 
+
 def depth_colormap(
     depth: NDArray[np.float64],
     cmap: str = "turbo",
@@ -517,7 +553,7 @@ def depth_colormap(
     -------
     coloured : (H, W, 3) uint8 array
     """
-    import matplotlib.cm as cm
+    import matplotlib
 
     valid_mask = depth > invalid_value
     d = depth.copy().astype(np.float64)
@@ -528,7 +564,7 @@ def depth_colormap(
     else:
         d[:] = 0
 
-    mapper = cm.get_cmap(cmap)
+    mapper = matplotlib.colormaps[cmap]
     coloured = (mapper(d)[:, :, :3] * 255).astype(np.uint8)
     coloured[~valid_mask] = 0
 
@@ -539,9 +575,10 @@ def depth_colormap(
 #  Optical flow colour visualisation
 # ======================================================================
 
+
 def flow_to_color(
     flow: NDArray[np.float64],
-    max_flow: Optional[float] = None,
+    max_flow: float | None = None,
 ) -> NDArray[np.uint8]:
     """HSV colour-wheel visualisation for 2-D optical flow.
 
@@ -559,7 +596,7 @@ def flow_to_color(
     import colorsys
 
     u, v = flow[:, :, 0], flow[:, :, 1]
-    mag = np.sqrt(u ** 2 + v ** 2)
+    mag = np.sqrt(u**2 + v**2)
     angle = np.arctan2(v, u)
 
     if max_flow is None:
@@ -585,12 +622,13 @@ def flow_to_color(
 #  Side-by-side comparison
 # ======================================================================
 
+
 def side_by_side_comparison(
-    images: Sequence[NDArray],
+    images: Sequence[NDArray[np.generic]],
     titles: Sequence[str],
-    figsize: Optional[Tuple[int, int]] = None,
-    cmaps: Optional[Sequence[Optional[str]]] = None,
-) -> object:
+    figsize: tuple[int, int] | None = None,
+    cmaps: Sequence[str | None] | None = None,
+) -> Figure:
     """Display multiple images side by side.
 
     Parameters
@@ -616,7 +654,7 @@ def side_by_side_comparison(
     if n == 1:
         axes = [axes]
 
-    for ax, img, title, cmap in zip(axes, images, titles, cmaps):
+    for ax, img, title, cmap in zip(axes, images, titles, cmaps, strict=False):
         if cmap is not None:
             ax.imshow(img, cmap=cmap)
         elif img.ndim == 2:
@@ -634,14 +672,15 @@ def side_by_side_comparison(
 #  3-D scene rendering
 # ======================================================================
 
+
 def render_3d_scene(
-    points: Optional[NDArray] = None,
-    poses: Optional[Sequence[NDArray]] = None,
-    K: Optional[NDArray] = None,
-    point_colors: Optional[NDArray] = None,
+    points: NDArray[np.float64] | None = None,
+    poses: Sequence[NDArray[np.float64]] | None = None,
+    K: NDArray[np.float64] | None = None,
+    point_colors: NDArray[np.float64] | None = None,
     title: str = "3D Scene",
-    figsize: Tuple[int, int] = (12, 8),
-) -> object:
+    figsize: tuple[int, int] = (12, 8),
+) -> Axes3D:
     """Render a combined 3-D scene with point cloud and camera poses.
 
     Parameters
@@ -660,14 +699,13 @@ def render_3d_scene(
     import matplotlib.pyplot as plt
 
     fig = plt.figure(figsize=figsize)
-    ax = fig.add_subplot(111, projection="3d")
+    ax = cast("Axes3D", fig.add_subplot(111, projection="3d"))
 
     if points is not None:
-        ax = plot_pointcloud_3d(points, colors=point_colors, ax=ax,
-                                title="", point_size=0.5)
+        plot_pointcloud_3d(points, colors=point_colors, ax=ax, title="", point_size=0.5)
 
     if poses is not None:
-        ax = plot_cameras_3d(poses, K=K, ax=ax, scale=0.2)
+        plot_cameras_3d(poses, K=K, ax=ax, scale=0.2)
 
     ax.set_title(title)
     return ax
@@ -677,9 +715,8 @@ def render_3d_scene(
 #  Internal helpers
 # ======================================================================
 
-def _set_equal_aspect_3d(ax: object) -> None:
+
+def _set_equal_aspect_3d(ax: Axes3D) -> None:
     """Set equal aspect ratio on a 3-D Matplotlib axes."""
-    try:
+    with contextlib.suppress(AttributeError, TypeError):
         ax.set_box_aspect([1, 1, 1])
-    except (AttributeError, TypeError):
-        pass

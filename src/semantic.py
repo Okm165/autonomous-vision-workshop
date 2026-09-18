@@ -33,37 +33,73 @@ References
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from typing import Any
 
 import cv2
 import numpy as np
 from numpy.typing import NDArray
-
 
 # ======================================================================
 #  Default colour palette (Pascal VOC / COCO-style)
 # ======================================================================
 
 _DEFAULT_CLASSES = [
-    "background", "aeroplane", "bicycle", "bird", "boat", "bottle",
-    "bus", "car", "cat", "chair", "cow", "dining_table", "dog",
-    "horse", "motorbike", "person", "potted_plant", "sheep", "sofa",
-    "train", "tv_monitor",
+    "background",
+    "aeroplane",
+    "bicycle",
+    "bird",
+    "boat",
+    "bottle",
+    "bus",
+    "car",
+    "cat",
+    "chair",
+    "cow",
+    "dining_table",
+    "dog",
+    "horse",
+    "motorbike",
+    "person",
+    "potted_plant",
+    "sheep",
+    "sofa",
+    "train",
+    "tv_monitor",
 ]
 
-_DEFAULT_PALETTE = np.array([
-    [0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0],
-    [0, 0, 128], [128, 0, 128], [0, 128, 128], [128, 128, 128],
-    [64, 0, 0], [192, 0, 0], [64, 128, 0], [192, 128, 0],
-    [64, 0, 128], [192, 0, 128], [64, 128, 128], [192, 128, 128],
-    [0, 64, 0], [128, 64, 0], [0, 192, 0], [128, 192, 0],
-    [0, 64, 128],
-], dtype=np.uint8)
+_DEFAULT_PALETTE = np.array(
+    [
+        [0, 0, 0],
+        [128, 0, 0],
+        [0, 128, 0],
+        [128, 128, 0],
+        [0, 0, 128],
+        [128, 0, 128],
+        [0, 128, 128],
+        [128, 128, 128],
+        [64, 0, 0],
+        [192, 0, 0],
+        [64, 128, 0],
+        [192, 128, 0],
+        [64, 0, 128],
+        [192, 0, 128],
+        [64, 128, 128],
+        [192, 128, 128],
+        [0, 64, 0],
+        [128, 64, 0],
+        [0, 192, 0],
+        [128, 192, 0],
+        [0, 64, 128],
+    ],
+    dtype=np.uint8,
+)
 
 
 # ======================================================================
 #  SemanticSegmenter
 # ======================================================================
+
 
 class SemanticSegmenter:
     """Semantic segmentation wrapper.
@@ -86,6 +122,12 @@ class SemanticSegmenter:
         PyTorch device string (ignored for the simple model).
     """
 
+    model_name: str
+    num_classes: int
+    device: str
+    _class_names: list[str]
+    _palette: NDArray[np.uint8]
+
     def __init__(
         self,
         model_name: str = "simple",
@@ -96,7 +138,7 @@ class SemanticSegmenter:
         self.model_name = model_name.lower()
         self.num_classes = num_classes
         self.device = device
-        self._model = None
+        self._model: Any | None = None
         self._class_names = _DEFAULT_CLASSES[:num_classes]
         self._palette = _DEFAULT_PALETTE[:num_classes]
 
@@ -106,24 +148,29 @@ class SemanticSegmenter:
             return
         if self.model_name == "deeplabv3":
             try:
-                import torch
-                import torchvision
+                import torch  # noqa: F401  (availability probe)  # pyright: ignore[reportMissingImports]
+                import torchvision  # pyright: ignore[reportMissingImports]
             except ImportError as exc:
                 raise ImportError(
                     "DeepLabV3 requires PyTorch + torchvision. "
                     "Install with: pip install torch torchvision"
                 ) from exc
-            self._model = torchvision.models.segmentation.deeplabv3_resnet101(
-                weights="DEFAULT",
-            ).to(self.device).eval()
+            self._model = (
+                torchvision.models.segmentation.deeplabv3_resnet101(
+                    weights="DEFAULT",
+                )
+                .to(self.device)
+                .eval()
+            )
         else:
             raise ValueError(
                 f"Unknown model '{self.model_name}'; choose 'simple' or 'deeplabv3'."
             )
 
     def segment(
-        self, image: NDArray[np.uint8],
-    ) -> Tuple[NDArray[np.int32], NDArray[np.uint8]]:
+        self,
+        image: NDArray[np.uint8],
+    ) -> tuple[NDArray[np.int32], NDArray[np.uint8]]:
         """Segment an image into per-pixel class labels.
 
         Parameters
@@ -145,8 +192,9 @@ class SemanticSegmenter:
         return self._segment_deeplabv3(image)
 
     def segment_everything(
-        self, image: NDArray[np.uint8],
-    ) -> Tuple[NDArray[np.int32], NDArray[np.uint8]]:
+        self,
+        image: NDArray[np.uint8],
+    ) -> tuple[NDArray[np.int32], NDArray[np.uint8]]:
         """Segment all classes in the image (alias for ``segment``).
 
         SAM2-style "segment everything" — assigns a class label to every pixel.
@@ -165,9 +213,9 @@ class SemanticSegmenter:
     def segment_with_prompt(
         self,
         image: NDArray[np.uint8],
-        points: Optional[NDArray] = None,
-        boxes: Optional[NDArray] = None,
-    ) -> Tuple[NDArray[np.int32], NDArray[np.uint8]]:
+        points: NDArray[np.floating] | None = None,
+        boxes: NDArray[np.floating] | None = None,
+    ) -> tuple[NDArray[np.int32], NDArray[np.uint8]]:
         """Segment objects near user-provided prompt points or boxes.
 
         For the simple backend, this falls back to full segmentation.
@@ -191,7 +239,7 @@ class SemanticSegmenter:
         self,
         frames: Sequence[NDArray[np.uint8]],
         initial_masks: NDArray[np.int32],
-    ) -> List[NDArray[np.int32]]:
+    ) -> list[NDArray[np.int32]]:
         """Track segmentation masks across video frames.
 
         Simple nearest-neighbour tracking: for each frame, segment and
@@ -217,8 +265,9 @@ class SemanticSegmenter:
     # ------------------------------------------------------------------
 
     def _segment_simple(
-        self, image: NDArray[np.uint8],
-    ) -> Tuple[NDArray[np.int32], NDArray[np.uint8]]:
+        self,
+        image: NDArray[np.uint8],
+    ) -> tuple[NDArray[np.int32], NDArray[np.uint8]]:
         """Heuristic segmentation based on colour ranges in HSV space.
 
         This is *not* a production segmenter — it assigns rough labels
@@ -232,7 +281,7 @@ class SemanticSegmenter:
         # Sky: low saturation, high value, upper region
         height = image.shape[0]
         upper_half = np.zeros_like(labels, dtype=bool)
-        upper_half[:height // 2, :] = True
+        upper_half[: height // 2, :] = True
         labels[(s < 50) & (v > 180) & upper_half] = 0  # background / sky
 
         # Vegetation: green hue
@@ -260,18 +309,23 @@ class SemanticSegmenter:
     # ------------------------------------------------------------------
 
     def _segment_deeplabv3(
-        self, image: NDArray[np.uint8],
-    ) -> Tuple[NDArray[np.int32], NDArray[np.uint8]]:
+        self,
+        image: NDArray[np.uint8],
+    ) -> tuple[NDArray[np.int32], NDArray[np.uint8]]:
         """Run DeepLabV3-ResNet101 inference."""
-        import torch
-        from torchvision import transforms as T
+        assert self._model is not None, "DeepLabV3 model failed to load"
+        import torch  # pyright: ignore[reportMissingImports]
 
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        preprocess = T.Compose([
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-        input_tensor = preprocess(rgb).unsqueeze(0).to(self.device)
+        # Equivalent to ``ToTensor`` (HWC uint8 -> normalised CHW float tensor),
+        # written explicitly because the torchvision stub types ``ToTensor`` as
+        # returning an array-like, which erases the tensor type downstream.
+        chw = (
+            torch.as_tensor(np.ascontiguousarray(rgb)).permute(2, 0, 1).float() / 255.0
+        )
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        input_tensor = ((chw - mean) / std).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
             output = self._model(input_tensor)["out"][0]
@@ -300,7 +354,7 @@ class SemanticSegmenter:
         return overlay
 
     @property
-    def class_names(self) -> List[str]:
+    def class_names(self) -> list[str]:
         """Return the list of class names."""
         return list(self._class_names)
 
@@ -309,12 +363,13 @@ class SemanticSegmenter:
 #  Semantic point cloud
 # ======================================================================
 
+
 def semantic_pointcloud(
     points: NDArray[np.float64],
     colors: NDArray[np.float64],
     labels: NDArray[np.int32],
-    class_names: Optional[List[str]] = None,
-) -> Dict[str, NDArray[np.float64]]:
+    class_names: list[str] | None = None,
+) -> dict[str, NDArray[np.float64]]:
     """Create a semantic point cloud with per-point class labels.
 
     Groups points by their semantic class, returning a dictionary
@@ -340,7 +395,7 @@ def semantic_pointcloud(
     if class_names is None:
         class_names = _DEFAULT_CLASSES
 
-    result: Dict[str, NDArray[np.float64]] = {}
+    result: dict[str, NDArray[np.float64]] = {}
     unique_labels = np.unique(labels)
 
     for lbl in unique_labels:
@@ -355,6 +410,7 @@ def semantic_pointcloud(
 # ======================================================================
 #  SemanticTSDF
 # ======================================================================
+
 
 class SemanticTSDF:
     r"""TSDF volume extended with per-voxel semantic labels.
@@ -405,35 +461,35 @@ class SemanticTSDF:
 
     def __init__(
         self,
-        vol_bounds: NDArray,
+        vol_bounds: NDArray[np.floating],
         voxel_size: float = 0.05,
         num_classes: int = 21,
         trunc_dist: float = 0.15,
     ) -> None:
         """Initialise a TSDF volume with per-voxel semantic log-probabilities."""
         vol_bounds = np.asarray(vol_bounds, dtype=np.float64)
-        self.voxel_size = voxel_size
-        self.trunc_dist = trunc_dist
-        self.num_classes = num_classes
+        self.voxel_size: float = voxel_size
+        self.trunc_dist: float = trunc_dist
+        self.num_classes: int = num_classes
 
-        self._origin = vol_bounds[:, 0].copy()
-        dims = np.ceil(
-            (vol_bounds[:, 1] - vol_bounds[:, 0]) / voxel_size
-        ).astype(np.int32)
-        self._dims = tuple(dims)
+        self._origin: NDArray[np.float64] = vol_bounds[:, 0].copy()
+        dims = np.ceil((vol_bounds[:, 1] - vol_bounds[:, 0]) / voxel_size).astype(
+            np.int32
+        )
+        self._dims: tuple[int, ...] = tuple(dims)
 
-        self._tsdf = np.ones(self._dims, dtype=np.float32)
-        self._weight = np.zeros(self._dims, dtype=np.float32)
-        self._color = np.zeros((*self._dims, 3), dtype=np.float32)
+        self._tsdf: NDArray[np.float32] = np.ones(self._dims, dtype=np.float32)
+        self._weight: NDArray[np.float32] = np.zeros(self._dims, dtype=np.float32)
+        self._color: NDArray[np.float32] = np.zeros((*self._dims, 3), dtype=np.float32)
 
         # Log-probability histograms: uniform prior → log(1/C)
-        self._log_probs = np.full(
+        self._log_probs: NDArray[np.float32] = np.full(
             (*self._dims, num_classes),
             np.log(1.0 / num_classes),
             dtype=np.float32,
         )
 
-        self._voxel_coords = self._build_voxel_coords()
+        self._voxel_coords: NDArray[np.float64] = self._build_voxel_coords()
 
     def _build_voxel_coords(self) -> NDArray[np.float64]:
         """Pre-compute world coordinates of every voxel centre."""
@@ -451,7 +507,7 @@ class SemanticTSDF:
         K: NDArray[np.float64],
         T: NDArray[np.float64],
         labels: NDArray[np.int32],
-        confidences: Optional[NDArray[np.float32]] = None,
+        confidences: NDArray[np.float32] | None = None,
     ) -> None:
         r"""Integrate a depth frame with semantic labels.
 
@@ -494,8 +550,10 @@ class SemanticTSDF:
 
         valid = (
             (cam_z > 0)
-            & (pix_x >= 0) & (pix_x < w - 1)
-            & (pix_y >= 0) & (pix_y < h - 1)
+            & (pix_x >= 0)
+            & (pix_x < w - 1)
+            & (pix_y >= 0)
+            & (pix_y < h - 1)
         )
 
         pix_xi = np.clip(np.round(pix_x).astype(np.int32), 0, w - 1)
@@ -541,7 +599,12 @@ class SemanticTSDF:
 
     def get_semantic_mesh(
         self,
-    ) -> Tuple[NDArray, NDArray, NDArray, NDArray]:
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.int64],
+        NDArray[np.float64],
+        NDArray[np.int32],
+    ]:
         """Extract a triangle mesh with per-vertex semantic labels.
 
         Surface extraction uses Marching Cubes on the TSDF zero-crossing.
@@ -559,14 +622,34 @@ class SemanticTSDF:
         vertex_labels : ndarray, shape (V,), dtype int32
             Per-vertex semantic class index (MAP).
         """
+        from scipy.ndimage import binary_erosion
         from skimage.measure import marching_cubes
 
-        tsdf_vol = self._tsdf.copy()
         observed = self._weight > 0
+        if not observed.any():
+            return (
+                np.zeros((0, 3)),
+                np.zeros((0, 3), dtype=int),
+                np.zeros((0, 3)),
+                np.zeros(0, dtype=np.int32),
+            )
+
+        tsdf_vol = self._tsdf.copy()
+
+        # Same safeguard as ``TSDFVolume.extract_mesh``: unobserved voxels hold
+        # the initial +1, so cells at the observed/unobserved boundary present
+        # a false −1/+1 crossing.  Erode the observed region with a full 3×3×3
+        # structure so only cells whose 8 corners were all measured are meshed.
+        # If the observed band is thinner than one voxel on each side
+        # (trunc_dist < ~1.5 × voxel_size) the erosion is empty; fall back to
+        # the raw observed mask, which clamps the surface to the band boundary
+        # instead of producing no mesh at all.
         tsdf_vol[~observed] = 1.0
+        interior = binary_erosion(observed, structure=np.ones((3, 3, 3), dtype=bool))
+        mask = interior if interior.any() else observed
 
         try:
-            verts, faces, normals, _ = marching_cubes(tsdf_vol, level=0.0)
+            verts, faces, normals, _ = marching_cubes(tsdf_vol, level=0.0, mask=mask)
         except (ValueError, RuntimeError):
             return (
                 np.zeros((0, 3)),
@@ -575,19 +658,19 @@ class SemanticTSDF:
                 np.zeros(0, dtype=np.int32),
             )
 
-        verts_world = verts * self.voxel_size + self._origin
+        # ``marching_cubes`` returns vertices in continuous *index* space, where
+        # integer coordinate k refers to voxel k's centre — the same convention
+        # as ``_build_voxel_coords`` (origin + (k + 0.5) · voxel_size).  Omitting
+        # the half-voxel term shifts the whole mesh by half a voxel.
+        verts_world = self._origin + (verts + 0.5) * self.voxel_size
 
         # Look up semantic labels at each vertex
         vert_idx = np.clip(
-            np.round(
-                (verts_world - self._origin) / self.voxel_size
-            ).astype(int),
+            np.round((verts_world - self._origin) / self.voxel_size).astype(int),
             0,
             np.array(self._dims) - 1,
         )
-        log_p = self._log_probs[
-            vert_idx[:, 0], vert_idx[:, 1], vert_idx[:, 2]
-        ]
+        log_p = self._log_probs[vert_idx[:, 0], vert_idx[:, 1], vert_idx[:, 2]]
         vertex_labels = np.argmax(log_p, axis=1).astype(np.int32)
 
         return verts_world, faces, normals, vertex_labels

@@ -24,21 +24,20 @@ Usage example::
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
 
-from .features import detect_orb, match_bruteforce, ratio_test
-from .odometry import MonocularVO
-from .pointcloud import depth_to_pointcloud, transform_points, merge_pointclouds
-from .tsdf import TSDFVolume
 from .occupancy import OccupancyGrid
-
+from .odometry import MonocularVO
+from .pointcloud import depth_to_pointcloud, transform_points
+from .tsdf import TSDFVolume
 
 # ======================================================================
 #  LocalMapper
 # ======================================================================
+
 
 class LocalMapper:
     """Full local mapping pipeline combining all modules.
@@ -68,6 +67,14 @@ class LocalMapper:
     detector : str
         Feature detector for VO (``"orb"`` or ``"sift"``).
     """
+
+    K: NDArray[np.float64]
+    map_bounds: NDArray[np.float64]
+    voxel_size: float
+    use_semantic: bool
+    _vo: MonocularVO
+    _tsdf: TSDFVolume
+    _occupancy: OccupancyGrid
 
     def __init__(
         self,
@@ -100,21 +107,23 @@ class LocalMapper:
         )
 
         # Semantic TSDF (lazy init)
-        self._semantic_tsdf: Optional[object] = None
-        self._segmenter: Optional[object] = None
+        self._semantic_tsdf: Any | None = None
+        self._segmenter: Any | None = None
         if use_semantic:
-            from .semantic import SemanticTSDF, SemanticSegmenter
+            from .semantic import SemanticSegmenter, SemanticTSDF
+
             self._semantic_tsdf = SemanticTSDF(
                 vol_bounds=self.map_bounds,
                 voxel_size=voxel_size,
+                trunc_dist=3.0 * voxel_size,
             )
             self._segmenter = SemanticSegmenter(model_name="simple")
 
         # State
         self._frame_count: int = 0
-        self._pointclouds: List[NDArray] = []
-        self._poses: List[NDArray] = []
-        self._depth_estimator: Optional[object] = None
+        self._pointclouds: list[NDArray[np.float64]] = []
+        self._poses: list[NDArray[np.float64]] = []
+        self._depth_estimator: Any | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -123,7 +132,7 @@ class LocalMapper:
     def process_frame(
         self,
         rgb: NDArray[np.uint8],
-        depth: Optional[NDArray[np.float64]] = None,
+        depth: NDArray[np.float64] | None = None,
     ) -> NDArray[np.float64]:
         """Process a single frame: estimate pose, integrate depth.
 
@@ -167,16 +176,30 @@ class LocalMapper:
         self._occupancy.update(depth, self.K, T_cam_to_world)
 
         # 6. Semantic (optional)
-        if self.use_semantic and self._segmenter is not None:
+        if (
+            self.use_semantic
+            and self._segmenter is not None
+            and self._semantic_tsdf is not None
+        ):
             labels, _ = self._segmenter.segment(rgb)
             self._semantic_tsdf.integrate(
-                depth, self.K, T_cam_to_world, labels,
+                depth,
+                self.K,
+                T_cam_to_world,
+                labels,
             )
 
         self._frame_count += 1
         return T_cam_to_world
 
-    def get_mesh(self) -> Tuple[NDArray, NDArray, NDArray, NDArray]:
+    def get_mesh(
+        self,
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.int64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]:
         """Extract a triangle mesh from the TSDF volume.
 
         Applies Marching Cubes on the accumulated TSDF zero-crossing.
@@ -190,7 +213,17 @@ class LocalMapper:
         """
         return self._tsdf.extract_mesh()
 
-    def get_semantic_mesh(self) -> Optional[Tuple[NDArray, NDArray, NDArray, NDArray]]:
+    def get_semantic_mesh(
+        self,
+    ) -> (
+        tuple[
+            NDArray[np.float64],
+            NDArray[np.int64],
+            NDArray[np.float64],
+            NDArray[np.int64],
+        ]
+        | None
+    ):
         """Extract a semantically labelled mesh (if semantic mode is active).
 
         Returns
@@ -212,7 +245,7 @@ class LocalMapper:
         """
         return self._vo.get_trajectory()
 
-    def get_poses(self) -> List[NDArray[np.float64]]:
+    def get_poses(self) -> list[NDArray[np.float64]]:
         """Return all accumulated 4×4 camera-to-world poses.
 
         Returns
@@ -242,7 +275,14 @@ class LocalMapper:
         """
         return self._tsdf
 
-    def export_mesh(self) -> Tuple[NDArray, NDArray, NDArray, NDArray]:
+    def export_mesh(
+        self,
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.int64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]:
         """Extract a triangle mesh from the TSDF volume.
 
         Returns
@@ -266,7 +306,8 @@ class LocalMapper:
         * Occupied voxels from the occupancy grid
         """
         import matplotlib.pyplot as plt
-        from .viz import plot_cameras_3d, plot_pointcloud_3d, create_3d_axes
+
+        from .viz import plot_cameras_3d, plot_pointcloud_3d
 
         fig = plt.figure(figsize=(16, 6))
 
@@ -283,7 +324,9 @@ class LocalMapper:
             plot_pointcloud_3d(
                 tsdf_pc[:, :3],
                 colors=tsdf_pc[:, 3:6] if tsdf_pc.shape[1] >= 6 else None,
-                ax=ax2, subsample=10000, point_size=0.5,
+                ax=ax2,
+                subsample=10000,
+                point_size=0.5,
                 title="TSDF Point Cloud",
             )
         else:
@@ -294,7 +337,10 @@ class LocalMapper:
         occ_pts = self._occupancy.get_occupied_points(threshold=0.6)
         if len(occ_pts) > 0:
             plot_pointcloud_3d(
-                occ_pts, ax=ax3, subsample=10000, point_size=0.5,
+                occ_pts,
+                ax=ax3,
+                subsample=10000,
+                point_size=0.5,
                 title="Occupied Voxels",
             )
         else:
@@ -307,14 +353,18 @@ class LocalMapper:
     # Internals
     # ------------------------------------------------------------------
 
-    def _estimate_depth(self, rgb: NDArray[np.uint8]) -> Optional[NDArray]:
+    def _estimate_depth(self, rgb: NDArray[np.uint8]) -> NDArray[np.float64] | None:
         """Attempt neural monocular depth estimation."""
         try:
             if self._depth_estimator is None:
                 from .depth import DepthEstimator
+
                 self._depth_estimator = DepthEstimator(
-                    backend="depth_anything_v2", device="cpu",
+                    backend="depth_anything_v2",
+                    device="cpu",
                 )
             return self._depth_estimator.predict(rgb)
-        except (ImportError, RuntimeError):
+        except (ImportError, RuntimeError, OSError):
+            # OSError covers network failures while fetching pretrained weights
+            # (ConnectionError / FileNotFoundError are OSError subclasses).
             return None

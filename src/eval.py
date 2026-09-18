@@ -20,11 +20,10 @@ References
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
 
 import numpy as np
 from numpy.typing import NDArray
-
 
 # ======================================================================
 #  Umeyama alignment
@@ -32,8 +31,9 @@ from numpy.typing import NDArray
 
 
 def _umeyama_rotation(
-    H: np.ndarray, d: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    H: np.ndarray,
+    d: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute SVD of cross-covariance and build the rotation matrix."""
     U, S, Vt = np.linalg.svd(H)
     D = np.eye(d, dtype=np.float64)
@@ -44,7 +44,9 @@ def _umeyama_rotation(
 
 
 def _umeyama_scale(
-    S: np.ndarray, D: np.ndarray, var_src: float,
+    S: np.ndarray,
+    D: np.ndarray,
+    var_src: float,
 ) -> float:
     """Compute the optimal Umeyama scale from SVD singular values."""
     if var_src < 1e-15:
@@ -55,7 +57,7 @@ def _umeyama_scale(
 def align_trajectories_umeyama(
     source: NDArray[np.float64],
     target: NDArray[np.float64],
-) -> Tuple[float, NDArray[np.float64], NDArray[np.float64]]:
+) -> tuple[float, NDArray[np.float64], NDArray[np.float64]]:
     r"""Umeyama alignment (Sim(3)) of two point sets.
 
     Find the optimal scale *s*, rotation *R*, and translation
@@ -129,7 +131,7 @@ def align_trajectories_umeyama(
     src_c = source - mu_s
     tgt_c = target - mu_t
 
-    var_src = np.sum(src_c ** 2) / N
+    var_src = np.sum(src_c**2) / N
 
     H = (tgt_c.T @ src_c) / N
 
@@ -146,10 +148,11 @@ def align_trajectories_umeyama(
 #  Absolute Trajectory Error
 # ======================================================================
 
+
 def compute_ate(
     estimated_poses: Sequence[NDArray[np.float64]],
     gt_poses: Sequence[NDArray[np.float64]],
-) -> Tuple[float, float, float, NDArray[np.float64], float]:
+) -> tuple[float, float, float, NDArray[np.float64], float]:
     r"""Absolute Trajectory Error after Sim(3) alignment.
 
     **Procedure:**
@@ -197,7 +200,7 @@ def compute_ate(
     aligned = s * (est_pos @ R.T) + t
 
     errors = np.linalg.norm(gt_pos - aligned, axis=1)
-    ate_rmse = float(np.sqrt(np.mean(errors ** 2)))
+    ate_rmse = float(np.sqrt(np.mean(errors**2)))
     ate_mean = float(np.mean(errors))
     ate_median = float(np.median(errors))
 
@@ -208,7 +211,8 @@ def compute_ate(
 #  Scale Error (monocular systems)
 # ======================================================================
 
-def compute_scale_error(scale: float) -> Tuple[float, float]:
+
+def compute_scale_error(scale: float) -> tuple[float, float]:
     r"""Scale error from Umeyama alignment.
 
     For monocular VO/SLAM the estimated trajectory has unknown global
@@ -241,11 +245,12 @@ def compute_scale_error(scale: float) -> Tuple[float, float]:
 #  Relative Pose Error
 # ======================================================================
 
+
 def compute_rpe(
     estimated_poses: Sequence[NDArray[np.float64]],
     gt_poses: Sequence[NDArray[np.float64]],
     delta: int = 1,
-) -> Tuple[float, float, float, float]:
+) -> tuple[float, float, float, float]:
     r"""Relative Pose Error over pairs separated by *delta* frames.
 
     For each pair :math:`(i, i + \delta)`:
@@ -284,8 +289,8 @@ def compute_rpe(
     N = len(estimated_poses)
     assert len(gt_poses) == N, "Trajectory lengths must match."
 
-    trans_errors: List[float] = []
-    rot_errors: List[float] = []
+    trans_errors: list[float] = []
+    rot_errors: list[float] = []
 
     for i in range(N - delta):
         T_gt_i = np.asarray(gt_poses[i], dtype=np.float64)
@@ -308,9 +313,9 @@ def compute_rpe(
     trans_arr = np.array(trans_errors)
     rot_arr = np.array(rot_errors)
 
-    rpe_trans_rmse = float(np.sqrt(np.mean(trans_arr ** 2)))
+    rpe_trans_rmse = float(np.sqrt(np.mean(trans_arr**2)))
     rpe_trans_mean = float(np.mean(trans_arr))
-    rpe_rot_rmse = float(np.sqrt(np.mean(rot_arr ** 2)))
+    rpe_rot_rmse = float(np.sqrt(np.mean(rot_arr**2)))
     rpe_rot_mean = float(np.mean(rot_arr))
 
     return rpe_trans_rmse, rpe_trans_mean, rpe_rot_rmse, rpe_rot_mean
@@ -320,11 +325,12 @@ def compute_rpe(
 #  Depth evaluation metrics
 # ======================================================================
 
+
 def compute_depth_metrics(
-    predicted: NDArray[np.float64],
-    ground_truth: NDArray[np.float64],
-    mask: Optional[NDArray[np.bool_]] = None,
-) -> Dict[str, float]:
+    predicted: NDArray[np.floating],
+    ground_truth: NDArray[np.floating],
+    mask: NDArray[np.bool_] | None = None,
+) -> dict[str, float]:
     r"""Standard monocular depth evaluation metrics (Eigen et al. 2014).
 
     All metrics are computed over valid pixels only.
@@ -365,10 +371,10 @@ def compute_depth_metrics(
     gt = ground_truth[mask].astype(np.float64)
 
     if len(pred) == 0:
-        return {k: 0.0 for k in (
-            "abs_rel", "sq_rel", "rmse", "rmse_log",
-            "delta_1", "delta_2", "delta_3",
-        )}
+        return dict.fromkeys(
+            ("abs_rel", "sq_rel", "rmse", "rmse_log", "delta_1", "delta_2", "delta_3"),
+            0.0,
+        )
 
     pred = np.clip(pred, 1e-6, None)
     gt = np.clip(gt, 1e-6, None)
@@ -376,14 +382,14 @@ def compute_depth_metrics(
     diff = np.abs(pred - gt)
 
     abs_rel = float(np.mean(diff / gt))
-    sq_rel = float(np.mean(diff ** 2 / gt))
-    rmse = float(np.sqrt(np.mean(diff ** 2)))
+    sq_rel = float(np.mean(diff**2 / gt))
+    rmse = float(np.sqrt(np.mean(diff**2)))
     rmse_log = float(np.sqrt(np.mean((np.log(pred) - np.log(gt)) ** 2)))
 
     ratio = np.maximum(pred / gt, gt / pred)
     delta_1 = float(np.mean(ratio < 1.25))
-    delta_2 = float(np.mean(ratio < 1.25 ** 2))
-    delta_3 = float(np.mean(ratio < 1.25 ** 3))
+    delta_2 = float(np.mean(ratio < 1.25**2))
+    delta_3 = float(np.mean(ratio < 1.25**3))
 
     return {
         "abs_rel": abs_rel,
@@ -400,11 +406,12 @@ def compute_depth_metrics(
 #  3-D Reconstruction Metrics
 # ======================================================================
 
+
 def compute_reconstruction_metrics(
     pred_points: NDArray[np.float64],
     gt_points: NDArray[np.float64],
     f_score_threshold: float = 0.05,
-) -> dict:
+) -> dict[str, float]:
     r"""Compute Chamfer distance, accuracy, completeness, and F-score.
 
     **Chamfer distance** (bidirectional):
@@ -463,6 +470,7 @@ def compute_reconstruction_metrics(
 #  Trajectory comparison plot
 # ======================================================================
 
+
 def plot_trajectory_comparison(
     est_poses: Sequence[NDArray[np.float64]],
     gt_poses: Sequence[NDArray[np.float64]],
@@ -508,7 +516,9 @@ def plot_trajectory_comparison(
     # 2-D top-down (XZ)
     ax1 = fig.add_subplot(1, 2, 1)
     ax1.plot(gt_pos[:, 0], gt_pos[:, 2], "k-", label="Ground truth", linewidth=2)
-    ax1.plot(est_pos[:, 0], est_pos[:, 2], "r--", label=f"Estimated{suffix}", linewidth=1.5)
+    ax1.plot(
+        est_pos[:, 0], est_pos[:, 2], "r--", label=f"Estimated{suffix}", linewidth=1.5
+    )
     ax1.set_xlabel("X (m)")
     ax1.set_ylabel("Z (m)")
     ax1.set_title("Top-down (XZ)")
@@ -518,8 +528,22 @@ def plot_trajectory_comparison(
 
     # 3-D
     ax2 = fig.add_subplot(1, 2, 2, projection="3d")
-    ax2.plot3D(gt_pos[:, 0], gt_pos[:, 1], gt_pos[:, 2], "k-", label="Ground truth", linewidth=2)
-    ax2.plot3D(est_pos[:, 0], est_pos[:, 1], est_pos[:, 2], "r--", label=f"Estimated{suffix}", linewidth=1.5)
+    ax2.plot3D(
+        gt_pos[:, 0],
+        gt_pos[:, 1],
+        gt_pos[:, 2],
+        "k-",
+        label="Ground truth",
+        linewidth=2,
+    )
+    ax2.plot3D(
+        est_pos[:, 0],
+        est_pos[:, 1],
+        est_pos[:, 2],
+        "r--",
+        label=f"Estimated{suffix}",
+        linewidth=1.5,
+    )
     ax2.set_xlabel("X")
     ax2.set_ylabel("Y")
     ax2.set_zlabel("Z")
